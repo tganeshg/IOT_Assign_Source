@@ -33,15 +33,36 @@
 *Macros
 */
 #define APP_VERSION				"MP 1.2.0 09042025"
-#define MAX_SENS_SIMULATOR		3
+#define MAX_SENS_SIMULATOR		7
 #define MIN_MQTT_PUB_INTERVAL	1
 #define MAX_MQTT_PUB_INTERVAL	59
+#define MIN_PIR_POLL_MS         100
+#define MAX_PIR_POLL_MS         5000
 #define MQTT_PAYLOAD_MIN_SIZE   2
 
-#define CONFIG_FILE				"/root/config/config.ini"
+#define CONFIG_FILE				"/home/root/config/config_MP.ini"
 #define MQTT_CLIENT_ID			"ems_main_proc"
 #define MQTT_TOPIC				"sensor/data"
-#define DB_NAME					"/root/sensor_data.db"
+#define MQTT_MODE_AUTO          "AUTO"
+#define MQTT_MODE_MANUAL        "MANUAL"
+
+#define MQTT_TOPIC_CMD_MODE         "smarthome/cmd/mode"
+#define MQTT_TOPIC_CMD_R1_LIGHT     "smarthome/cmd/room1/light"
+#define MQTT_TOPIC_CMD_R1_FAN       "smarthome/cmd/room1/fan"
+#define MQTT_TOPIC_CMD_R2_LIGHT     "smarthome/cmd/room2/light"
+#define MQTT_TOPIC_CMD_R2_AC        "smarthome/cmd/room2/ac"
+#define MQTT_TOPIC_STATE_MODE       "smarthome/state/mode"
+#define MQTT_TOPIC_STATE_R1_PIR     "smarthome/state/room1/pir"
+#define MQTT_TOPIC_STATE_R1_LIGHT   "smarthome/state/room1/light"
+#define MQTT_TOPIC_STATE_R1_FAN     "smarthome/state/room1/fan"
+#define MQTT_TOPIC_STATE_R2_PIR     "smarthome/state/room2/pir"
+#define MQTT_TOPIC_STATE_R2_LIGHT   "smarthome/state/room2/light"
+#define MQTT_TOPIC_STATE_R2_AC      "smarthome/state/room2/ac"
+
+#define MODBUS_HOLDING_ADDR_POWER   3000
+#define MODBUS_COIL_ADDR_READ       1000
+#define MODBUS_COIL_ADDR_WRITE      5000
+#define DB_NAME					"/home/root/config/sensor_data.db"
 
 //for Flags use only
 extern UINT64 flag1;
@@ -77,11 +98,15 @@ typedef struct
     CHAR		*sensorIP[MAX_SENS_SIMULATOR];
     UINT16		sensorPort[MAX_SENS_SIMULATOR];
     UINT16		readInterval[MAX_SENS_SIMULATOR];
+    UINT16      pirPollMs[MAX_SENS_SIMULATOR];
     CHAR		*mqttIP;
     UINT16		mqttPort;
     CHAR		*mqttUsername;
     CHAR		*mqttPassword;
     UINT16		publishInterval;
+    UINT16      statePublishInterval;
+    CHAR        *uiFbdev;
+    CHAR        *uiTouchDev;
 }PROGRAM_ARGS;
 
 typedef struct
@@ -94,6 +119,13 @@ typedef struct
     UINT8               mConnected[MAX_SENS_SIMULATOR];
     CHAR                timestamp[SIZE_32];
     UINT16				power[MAX_SENS_SIMULATOR];
+    UINT8               pir[MAX_SENS_SIMULATOR];
+    UINT8               outputState[MAX_SENS_SIMULATOR];
+    UINT8               manualState[MAX_SENS_SIMULATOR];
+    UINT8               isAutoMode;
+    UINT64              lastPirPollTs[MAX_SENS_SIMULATOR];
+    UINT64              lastDataPubTs;
+    UINT64              lastStatePubTs;
     CHAR				payload[SIZE_2048];
 }MP_INST;
 #pragma pack(pop)

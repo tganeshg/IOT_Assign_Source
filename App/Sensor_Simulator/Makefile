@@ -22,16 +22,22 @@ CFLAGS	= -Wall -Wno-unused-variable -Wunused-but-set-variable -Wpointer-sign
 SRCDIR   = source
 INCDIR	 = include
 OBJDIR   = objects
-BINDIR   = bin
+BINDIR   = ../AppBin
 
 SOURCES  := $(wildcard $(SRCDIR)/*.c)
 INCLUDES := $(wildcard $(INCDIR)/*.h)
 OBJECTS  := $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 rm       = rm -Rf
 
-TARGET=sensor_simulator
- 
-$(BINDIR)/$(TARGET): $(OBJECTS)
+TARGET=SensorSimulator
+
+.PHONY: all
+all: $(BINDIR)/$(TARGET)
+
+$(BINDIR):
+	@mkdir -p $(BINDIR)
+
+$(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@$(CC) -o  $@ $(OBJECTS) $(LFLAGS)
 	@#cp $(TARGET) ../Firmware/bin
 	@echo "Linking completed!"

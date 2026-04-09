@@ -16,6 +16,7 @@
 
 /*** Includes ***/
 #include "general.h"
+#include "ui_lvgl.h"
 
 #define	CUR_SENS_SIMULATOR	curSs
 #define MODBUS_DEBUG		modDebug
@@ -26,6 +27,14 @@ UINT64	flag1;
 MP_INST	mpInst;
 UINT16	curSs;
 BOOL	debug,modDebug;
+
+#define IDX_HD1     0
+#define IDX_LMC1    1
+#define IDX_FMC1    2
+#define IDX_HD2     3
+#define IDX_LMC2    4
+#define IDX_AC2     5
+#define IDX_RM2     6
 
 /****************************************************************
 * Private Function
@@ -47,6 +56,20 @@ void generateTimestamp(char *buffer, size_t bufferSize)
     struct tm *t = localtime(&now);
     strftime(buffer, bufferSize, "%Y-%m-%d %H:%M:%S", t);
 }
+
+/*************************************************************************
+* @brief        Gets the current time in milliseconds.
+*
+* @details      This function gets the current time in milliseconds using the CLOCK_MONOTONIC clock.
+*
+* @return       UINT64  The current time in milliseconds.
+*************************************************************************/
+static UINT64 getTimeMs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((UINT64)ts.tv_sec * 1000ULL) + ((UINT64)ts.tv_nsec / 1000000ULL);
+}
 /*************************************************************************
 * @brief        Reads configuration from a file.
 *
@@ -64,7 +87,7 @@ void generateTimestamp(char *buffer, size_t bufferSize)
 static int iniHandler(void* user, const char* section, const char* name, const char* value)
 {
     PROGRAM_ARGS *args = (PROGRAM_ARGS*)user;
-	const CHAR *ssSection[MAX_SENS_SIMULATOR] = {"sensor1","sensor2","sensor3"};
+	const CHAR *ssSection[MAX_SENS_SIMULATOR] = {"HD_1","LMC_1","FMC_1","HD_2","LMC_2","AMC_2","RM_2"};
 	UINT16 ssIdx = 0;
 
 	for(ssIdx=0;ssIdx < CUR_SENS_SIMULATOR;ssIdx++)
@@ -77,6 +100,8 @@ static int iniHandler(void* user, const char* section, const char* name, const c
 				args->sensorPort[ssIdx] = (UINT16)atoi(value);
 			else if (strcmp(name, "readInterval") == 0)
 				args->readInterval[ssIdx] = (UINT16)atoi(value);
+            else if (strcmp(name, "pirPollMs") == 0)
+                args->pirPollMs[ssIdx] = (UINT16)atoi(value);
 		}
 	}
 
@@ -92,6 +117,16 @@ static int iniHandler(void* user, const char* section, const char* name, const c
             args->mqttPassword = strdup(value);
         else if (strcmp(name, "publishInterval") == 0)
             args->publishInterval = (UINT16)atoi(value);
+        else if (strcmp(name, "statePublishInterval") == 0)
+            args->statePublishInterval = (UINT16)atoi(value);
+    }
+
+    if (strcmp(section, "ui") == 0)
+    {
+        if (strcmp(name, "fbdev") == 0)
+            args->uiFbdev = strdup(value);
+        else if (strcmp(name, "touchDev") == 0)
+            args->uiTouchDev = strdup(value);
     }
 
     return RET_SUCCESS;
@@ -145,6 +180,26 @@ static ERROR_CODE readConfig(const CHAR *filename, PROGRAM_ARGS *args)
         return RET_FAILURE;
     }
 
+    if (args->statePublishInterval == 0)
+        args->statePublishInterval = 1;
+
+    if (args->pirPollMs[IDX_HD1] == 0)
+        args->pirPollMs[IDX_HD1] = 500;
+    if (args->pirPollMs[IDX_HD2] == 0)
+        args->pirPollMs[IDX_HD2] = 500;
+
+    if((args->pirPollMs[IDX_HD1] < MIN_PIR_POLL_MS || args->pirPollMs[IDX_HD1] > MAX_PIR_POLL_MS) ||
+       (args->pirPollMs[IDX_HD2] < MIN_PIR_POLL_MS || args->pirPollMs[IDX_HD2] > MAX_PIR_POLL_MS))
+    {
+        fprintf(stderr, "Error: PIR poll interval must be between %d and %d ms.\n", MIN_PIR_POLL_MS, MAX_PIR_POLL_MS);
+        return RET_FAILURE;
+    }
+
+    if (args->uiFbdev == NULL)
+        args->uiFbdev = strdup("/dev/fb0");
+    if (args->uiTouchDev == NULL)
+        args->uiTouchDev = strdup("/dev/input/event0");
+
     return RET_OK;
 }
 
@@ -190,9 +245,37 @@ static ERROR_CODE connectModbus(modbus_t **ctx, const CHAR *ip, UINT16 port)
 }
 
 /*************************************************************************
-* @brief        Reads data from the Modbus TCP server.
+* @brief        Checks if the index is a PIR index.
 *
-* @details      This function reads the power consumption data from the Modbus TCP server.
+* @details      This function checks if the index is a PIR index.
+*
+* @param[in]    idx         The index to check.
+*
+* @return       BOOL        Returns TRUE if the index is a PIR index, otherwise returns FALSE.
+*************************************************************************/
+static BOOL isPIRIndex(UINT16 idx)
+{
+    return (idx == IDX_HD1 || idx == IDX_HD2) ? TRUE : FALSE;
+}
+
+/*************************************************************************
+* @brief        Checks if the index is a control index.
+*
+* @details      This function checks if the index is a control index.
+*
+* @param[in]    idx         The index to check.
+*
+* @return       BOOL        Returns TRUE if the index is a control index, otherwise returns FALSE.
+*************************************************************************/
+static BOOL isControlIndex(UINT16 idx)
+{
+    return (idx == IDX_LMC1 || idx == IDX_FMC1 || idx == IDX_LMC2 || idx == IDX_AC2) ? TRUE : FALSE;
+}
+
+/*************************************************************************
+* @brief        Reads holding register from Modbus TCP server.
+*
+* @details      This function reads power consumption value from holding register 3000.
 *
 * @param[in]    ctx         The Modbus context.
 * @param[out]   power       Pointer to the variable where the power consumption data will be stored.
@@ -200,24 +283,65 @@ static ERROR_CODE connectModbus(modbus_t **ctx, const CHAR *ip, UINT16 port)
 * @return       ERROR_CODE  Returns RET_OK if the data is successfully read,
 *                           otherwise returns RET_FAILURE.
 *************************************************************************/
-static ERROR_CODE readModbus(modbus_t *ctx, UINT16 *power)
+static ERROR_CODE readModbusPower(modbus_t *ctx, UINT16 *power)
 {
-    UINT8 tab_reg[MODBUS_TCP_MAX_ADU_LENGTH]={0};
-	UINT16 val=0;
-	const uint8_t raw_req[] = { 0xFF, MODBUS_FC_READ_HOLDING_REGISTERS, 0x00, 0x00, 0x00, 0x01 };
-	int req_length = modbus_send_raw_request(ctx, raw_req, 6 * sizeof(uint8_t));
-
-	if(modbus_receive_confirmation(ctx, tab_reg) == -1)
+    UINT16 regVal = 0;
+	if(modbus_read_registers(ctx, MODBUS_HOLDING_ADDR_POWER, 1, &regVal) != 1)
     {
         fprintf(stderr, "Failed to read registers: %s\n", modbus_strerror(errno));
         return RET_FAILURE;
     }
 
-	*power = tab_reg[1];
-	*power = (*power << 8) | tab_reg[0];
+	*power = regVal;
 	if(DEBUG_LOG)
 		fprintf(stdout, "Received modbus data %d\n",*power);
 
+    return RET_OK;
+}
+
+/*************************************************************************
+* @brief        Reads coil from Modbus TCP server.
+*
+* @details      This function reads coil from Modbus TCP server.
+*
+* @param[in]    ctx         The Modbus context.
+* @param[in]    address     The address of the coil.
+* @param[out]   state       Pointer to the variable where the coil state will be stored.
+*
+* @return       ERROR_CODE  Returns RET_OK if the data is successfully read,
+*                           otherwise returns RET_FAILURE.
+*************************************************************************/
+static ERROR_CODE readModbusCoil(modbus_t *ctx, UINT16 address, UINT8 *state)
+{
+    UINT8 coil = 0;
+    if (modbus_read_bits(ctx, address, 1, &coil) != 1)
+    {
+        fprintf(stderr, "Failed to read coil(%u): %s\n", address, modbus_strerror(errno));
+        return RET_FAILURE;
+    }
+    *state = coil;
+    return RET_OK;
+}
+
+/*************************************************************************
+* @brief        Writes coil to Modbus TCP server.
+*
+* @details      This function writes coil to Modbus TCP server.
+*
+* @param[in]    ctx         The Modbus context.
+* @param[in]    address     The address of the coil.
+* @param[in]    state       The state of the coil.
+*
+* @return       ERROR_CODE  Returns RET_OK if the data is successfully written,
+*                           otherwise returns RET_FAILURE.
+*************************************************************************/
+static ERROR_CODE writeModbusCoil(modbus_t *ctx, UINT16 address, UINT8 state)
+{
+    if (modbus_write_bit(ctx, address, state) == RET_FAILURE)
+    {
+        fprintf(stderr, "Failed to write coil(%u): %s\n", address, modbus_strerror(errno));
+        return RET_FAILURE;
+    }
     return RET_OK;
 }
 
@@ -322,12 +446,42 @@ static ERROR_CODE publishMQTT(struct mosquitto *mosq, sqlite3 *db, UINT16 publis
     return RET_OK;
 }
 
-/* Callback for successful connection to the MQTT broker */
+/*************************************************************************
+* @brief        Publishes state topic to the MQTT broker.
+*
+* @details      This function publishes the state topic to the MQTT broker.
+*
+* @param[in]    topic       The topic to publish.
+* @param[in]    payload     The payload to publish.
+*
+* @return       void
+*************************************************************************/
+static void publishStateTopic(const CHAR *topic, const CHAR *payload)
+{
+    INT32 rc = mosquitto_publish(mpInst.mosq, NULL, topic, (INT32)strlen(payload), payload, 0, false);
+    if (rc != MOSQ_ERR_SUCCESS && DEBUG_LOG)
+        fprintf(stderr, "State publish failed for %s: %s\n", topic, mosquitto_strerror(rc));
+}
+
+/*************************************************************************
+* @brief        Callback for successful connection to the MQTT broker.
+*
+* @details      This function is called when the MQTT broker is successfully connected.
+*
+* @param[in]    mosq        The Mosquitto instance.
+* @param[in]    obj         The user data.
+* @param[in]    rc          The return code.
+*************************************************************************/
 static void on_connect(struct mosquitto *mosq, void *obj, int rc)
 {
     if(rc == 0)
 	{
 		SET_FLAG(MQTT_CONNECTED);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_MODE, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R1_LIGHT, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R1_FAN, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R2_LIGHT, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R2_AC, 0);
 		if(DEBUG_LOG)
 			fprintf(stdout,"Connected to MQTT broker successfully.\n");
 	}
@@ -335,36 +489,174 @@ static void on_connect(struct mosquitto *mosq, void *obj, int rc)
         fprintf(stderr, "Failed to connect to MQTT broker, return code: %d\n", rc);
 }
 
-/* Callback for successful message publication */
+/*************************************************************************
+* @brief        Callback for successful message publication.
+*
+* @details      This function is called when a message is successfully published.
+*
+* @param[in]    mosq        The Mosquitto instance.
+* @param[in]    obj         The user data.
+* @param[in]    mid         The message ID.
+*************************************************************************/
 static void on_publish(struct mosquitto *mosq, void *obj, int mid)
 {
 	if(DEBUG_LOG)
 		fprintf(stdout,"Message published successfully, message ID: %d\n", mid);
 }
 
-/* Callback for logging */
+/*************************************************************************
+* @brief        Callback for logging.
+*
+* @details      This function is called when a log message is received.
+*
+* @param[in]    mosq        The Mosquitto instance.
+* @param[in]    obj         The user data.
+* @param[in]    level       The level of the log message.
+* @param[in]    str         The log message.
+*************************************************************************/
 static void on_log(struct mosquitto *mosq, void *obj, int level, const char *str)
 {
 	if(DEBUG_LOG)
 		fprintf(stdout,"MQTT Log: %s\n", str);
 }
 
+/*************************************************************************
+* @brief        Parses the switch payload.
+*
+* @details      This function parses the switch payload.
+*
+* @param[in]    payload     The payload to parse.
+*
+* @return       UINT8       Returns 1 if the payload is "1", "on", or "true", otherwise returns 0.
+*************************************************************************/
+static UINT8 parseSwitchPayload(const CHAR *payload)
+{
+    if ((strcmp(payload, "1") == 0) || (strcasecmp(payload, "on") == 0) || (strcasecmp(payload, "true") == 0))
+        return 1;
+    return 0;
+}
+
+/*************************************************************************
+* @brief        Callback for message reception.
+*
+* @details      This function is called when a message is received.
+*
+* @param[in]    mosq        The Mosquitto instance.
+* @param[in]    obj         The user data.
+* @param[in]    msg         The message.
+*************************************************************************/
+static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto_message *msg)
+{
+    CHAR payload[SIZE_64] = {0};
+    size_t copyLen = 0;
+
+    if ((msg == NULL) || (msg->payload == NULL) || (msg->topic == NULL))
+        return;
+
+    copyLen = (msg->payloadlen >= (INT32)sizeof(payload)) ? (sizeof(payload) - 1U) : (size_t)msg->payloadlen;
+    memcpy(payload, msg->payload, copyLen);
+    payload[copyLen] = '\0';
+
+    if (strcmp(msg->topic, MQTT_TOPIC_CMD_MODE) == 0)
+    {
+        mpInst.isAutoMode = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        return;
+    }
+    if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_LIGHT) == 0)
+        mpInst.manualState[IDX_LMC1] = parseSwitchPayload(payload);
+    else if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_FAN) == 0)
+        mpInst.manualState[IDX_FMC1] = parseSwitchPayload(payload);
+    else if (strcmp(msg->topic, MQTT_TOPIC_CMD_R2_LIGHT) == 0)
+        mpInst.manualState[IDX_LMC2] = parseSwitchPayload(payload);
+    else if (strcmp(msg->topic, MQTT_TOPIC_CMD_R2_AC) == 0)
+        mpInst.manualState[IDX_AC2] = parseSwitchPayload(payload);
+}
+
+/*************************************************************************
+* @brief        Applies the control policy.
+*
+* @details      This function applies the control policy based on the mode and PIR sensor values.
+*
+* @return       void
+*************************************************************************/
+static VOID applyControlPolicy(VOID)
+{
+    if (mpInst.isAutoMode)
+    {
+        mpInst.outputState[IDX_LMC1] = mpInst.pir[IDX_HD1];
+        mpInst.outputState[IDX_FMC1] = mpInst.pir[IDX_HD1];
+        mpInst.outputState[IDX_LMC2] = mpInst.pir[IDX_HD2];
+        mpInst.outputState[IDX_AC2] = mpInst.pir[IDX_HD2];
+    }
+    else
+    {
+        mpInst.outputState[IDX_LMC1] = mpInst.manualState[IDX_LMC1];
+        mpInst.outputState[IDX_FMC1] = mpInst.manualState[IDX_FMC1];
+        mpInst.outputState[IDX_LMC2] = mpInst.manualState[IDX_LMC2];
+        mpInst.outputState[IDX_AC2] = mpInst.manualState[IDX_AC2];
+    }
+}
+
+/*************************************************************************
+* @brief        Applies the UI commands.
+*
+* @details      This function applies the UI commands.
+*
+* @return       void
+*************************************************************************/
+static VOID applyUICommands(VOID)
+{
+    UI_COMMANDS cmd;
+
+    if (uiFetchCommands(&cmd) != RET_OK)
+        return;
+
+    if (cmd.hasMode)
+        mpInst.isAutoMode = cmd.isAutoMode ? TRUE : FALSE;
+
+    if (cmd.hasRoom1Light)
+        mpInst.manualState[IDX_LMC1] = cmd.room1Light ? 1U : 0U;
+    if (cmd.hasRoom1Fan)
+        mpInst.manualState[IDX_FMC1] = cmd.room1Fan ? 1U : 0U;
+    if (cmd.hasRoom2Light)
+        mpInst.manualState[IDX_LMC2] = cmd.room2Light ? 1U : 0U;
+    if (cmd.hasRoom2AC)
+        mpInst.manualState[IDX_AC2] = cmd.room2AC ? 1U : 0U;
+}
+
+/*************************************************************************
+* @brief        Prints the usage information.
+*
+* @details      This function prints the usage information.
+*
+* @return       void
+*************************************************************************/
 static void printUsage(void)
 {
     fprintf(stdout,"Usage: ems_mainProc [OPTIONS]\n");
     fprintf(stdout,"Options:\n");
-    fprintf(stdout,"  -n <max sensor>       Max number of sensor simulator(Upto 3)\n");
+    fprintf(stdout,"  -n <max sensor>       Max number of sensor simulator(Upto 7)\n");
     fprintf(stdout,"  -d                    Enable debug\n");
     fprintf(stdout,"  -h, --help            Show this help message and exit\n");
 }
 
-/****************************************************************
-* Main
-****************************************************************/
+/*************************************************************************
+* @brief        Main function.
+*
+* @details      This function is the main function of the program.
+*
+* @param[in]    argc        The number of arguments.
+* @param[in]    argv        The arguments.
+* @param[in]    envp        The environment variables.
+*
+* @return       INT32       Returns 0 if the program exits successfully, otherwise returns -1.
+*************************************************************************/
 INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 {
     INT32	rc = 0;
 	UINT16	idx = 0;
+    time_t nowTs = 0;
+    UINT64 nowMs = 0;
 
 	while((rc = getopt(argc, argv, "n:h:d")) != RET_FAILURE)
     {
@@ -409,6 +701,12 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 					break;
 				}
 
+                if (uiInit(mpInst.args.uiFbdev, mpInst.args.uiTouchDev) != RET_OK)
+                {
+                    mpInst.state = STATE_ERROR;
+                    break;
+                }
+
 				/* Initialize SQLite database */
 				rc = sqlite3_open(DB_NAME, &mpInst.db);
 				if(rc != SQLITE_OK)
@@ -429,6 +727,7 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 				{
 					fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(mpInst.db));
 					sqlite3_close(mpInst.db);
+					mpInst.db = NULL;
 					mpInst.state = STATE_ERROR;
 					break;
 				}
@@ -441,6 +740,8 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 				{
 					fprintf(stderr, "Failed to create mosquitto instance\n");
 					sqlite3_close(mpInst.db);
+					mpInst.db = NULL;
+					mosquitto_lib_cleanup();
 					mpInst.state = STATE_ERROR;
 					break;
 				}
@@ -452,6 +753,7 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 				mosquitto_connect_callback_set(mpInst.mosq, on_connect);
 				mosquitto_publish_callback_set(mpInst.mosq, on_publish);
 				mosquitto_log_callback_set(mpInst.mosq, on_log);
+                mosquitto_message_callback_set(mpInst.mosq, on_message);
 
 				/* Connect to MQTT broker */
 				rc = mosquitto_connect(mpInst.mosq, mpInst.args.mqttIP, mpInst.args.mqttPort, 60);
@@ -459,7 +761,9 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 				{
 					fprintf(stderr, "Failed to connect to MQTT broker: %s\n", mosquitto_strerror(rc));
 					sqlite3_close(mpInst.db);
+					mpInst.db = NULL;
 					mosquitto_destroy(mpInst.mosq);
+					mpInst.mosq = NULL;
 					mosquitto_lib_cleanup();
 					mpInst.state = STATE_ERROR;
 					break;
@@ -473,6 +777,12 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 						if(DEBUG_LOG)
 							fprintf(stderr,"Mqtt Loop thread start error..\n");
 
+						mosquitto_disconnect(mpInst.mosq);
+						mosquitto_destroy(mpInst.mosq);
+						mpInst.mosq = NULL;
+						sqlite3_close(mpInst.db);
+						mpInst.db = NULL;
+						mosquitto_lib_cleanup();
 						mpInst.state = STATE_ERROR;
 						break;
 					}
@@ -488,6 +798,12 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 			break;
             case STATE_CONNECT_MODBUS:
 			{
+                UI_STATE uiState;
+                memset(&uiState, 0, sizeof(uiState));
+
+                uiProcess();
+                applyUICommands();
+
                 for(idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
                 {
                     if(!mpInst.mConnected[idx] && connectModbus(&mpInst.ctx[idx], mpInst.args.sensorIP[idx], mpInst.args.sensorPort[idx]) != RET_OK)
@@ -503,10 +819,43 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 
                     if(mpInst.mConnected[idx])
                     {
-                        if(readModbus(mpInst.ctx[idx], &mpInst.power[idx]) != RET_OK)
+                        if (isPIRIndex(idx))
+                        {
+                            nowMs = getTimeMs();
+                            if ((mpInst.lastPirPollTs[idx] == 0U) || ((nowMs - mpInst.lastPirPollTs[idx]) >= mpInst.args.pirPollMs[idx]))
+                            {
+                                if(readModbusCoil(mpInst.ctx[idx], MODBUS_COIL_ADDR_READ, &mpInst.pir[idx]) != RET_OK)
+                                    mpInst.mConnected[idx] = FALSE;
+                                else
+                                    mpInst.lastPirPollTs[idx] = nowMs;
+                            }
+                        }
+                        else
+                        {
+                            if(readModbusPower(mpInst.ctx[idx], &mpInst.power[idx]) != RET_OK)
+                                mpInst.mConnected[idx] = FALSE;
+                        }
+                    }
+                }
+
+                applyControlPolicy();
+                for (idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
+                {
+                    if (mpInst.mConnected[idx] && isControlIndex(idx))
+                    {
+                        if (writeModbusCoil(mpInst.ctx[idx], MODBUS_COIL_ADDR_WRITE, mpInst.outputState[idx]) != RET_OK)
                             mpInst.mConnected[idx] = FALSE;
                     }
                 }
+
+                uiState.isAutoMode = mpInst.isAutoMode;
+                uiState.pirRoom1 = mpInst.pir[IDX_HD1];
+                uiState.pirRoom2 = mpInst.pir[IDX_HD2];
+                uiState.room1Light = mpInst.outputState[IDX_LMC1];
+                uiState.room1Fan = mpInst.outputState[IDX_FMC1];
+                uiState.room2Light = mpInst.outputState[IDX_LMC2];
+                uiState.room2AC = mpInst.outputState[IDX_AC2];
+                uiUpdateState(&uiState);
 
                 mpInst.state = STATE_INSERT_DB;
 			}
@@ -515,7 +864,7 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 			{
                 for(idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
                 {
-                    if(mpInst.mConnected[idx])
+                    if(mpInst.mConnected[idx] && !isPIRIndex(idx))
                         insertDB(mpInst.db, (idx + 1), mpInst.power[idx]);
                 }
                 mpInst.state = STATE_PUBLISH_MQTT;
@@ -523,15 +872,31 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
             break;
             case STATE_PUBLISH_MQTT:
 			{
-                if(publishMQTT(mpInst.mosq, mpInst.db, mpInst.args.publishInterval) != RET_OK)
-					mpInst.state = STATE_ERROR;
-                else
+                nowTs = time(NULL);
+                if ((mpInst.lastDataPubTs == 0U) || ((UINT64)nowTs - mpInst.lastDataPubTs >= mpInst.args.publishInterval))
                 {
-                    for(idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
-                        sleep(mpInst.args.readInterval[idx]);
-
-                    mpInst.state = STATE_CONNECT_MODBUS;
+                    if(publishMQTT(mpInst.mosq, mpInst.db, mpInst.args.publishInterval) != RET_OK)
+                    {
+                        mpInst.state = STATE_ERROR;
+                        break;
+                    }
+                    mpInst.lastDataPubTs = (UINT64)nowTs;
                 }
+
+                if ((mpInst.lastStatePubTs == 0U) || ((UINT64)nowTs - mpInst.lastStatePubTs >= mpInst.args.statePublishInterval))
+                {
+                    publishStateTopic(MQTT_TOPIC_STATE_MODE, mpInst.isAutoMode ? MQTT_MODE_AUTO : MQTT_MODE_MANUAL);
+                    publishStateTopic(MQTT_TOPIC_STATE_R1_PIR, mpInst.pir[IDX_HD1] ? "1" : "0");
+                    publishStateTopic(MQTT_TOPIC_STATE_R2_PIR, mpInst.pir[IDX_HD2] ? "1" : "0");
+                    publishStateTopic(MQTT_TOPIC_STATE_R1_LIGHT, mpInst.outputState[IDX_LMC1] ? "1" : "0");
+                    publishStateTopic(MQTT_TOPIC_STATE_R1_FAN, mpInst.outputState[IDX_FMC1] ? "1" : "0");
+                    publishStateTopic(MQTT_TOPIC_STATE_R2_LIGHT, mpInst.outputState[IDX_LMC2] ? "1" : "0");
+                    publishStateTopic(MQTT_TOPIC_STATE_R2_AC, mpInst.outputState[IDX_AC2] ? "1" : "0");
+                    mpInst.lastStatePubTs = (UINT64)nowTs;
+                }
+
+                usleep(100000U);
+                mpInst.state = STATE_CONNECT_MODBUS;
 			}
             break;
             default:

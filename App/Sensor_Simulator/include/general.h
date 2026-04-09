@@ -30,7 +30,7 @@
 *Macros
 */
 #define APP_VERSION				    "SS 1.2.0 09042025"
-#define MAX_SENS_SIMULATOR			3
+#define MAX_SENS_SIMULATOR			7
 
 /* Define power consumption ranges */
 #define FAN_MIN_POWER               10
@@ -41,8 +41,8 @@
 #define FRIDGE_MAX_POWER            800
 
 /* Define Modbus register address */
-#define MODBUS_REGISTER_ADDRESS     0
-#define MODBUS_REGISTER_COUNT       1
+#define MODBUS_REGISTER_ADDRESS     3000
+#define MODBUS_REGISTER_COUNT       (MODBUS_REGISTER_ADDRESS + 1)
 
 /*************************************************************************
 * @brief        Enumeration for the state machine states.
@@ -89,6 +89,7 @@ typedef struct
     UINT16              sensorID;       /**< The ID of the sensor */
     UINT16              minPower;       /**< The minimum power consumption value */
     UINT16              maxPower;       /**< The maximum power consumption value */
+    UINT16              controlGPIO;    /**< GPIO pin for control sensors */
     UINT16              power;          /**< The current power consumption value */
     INT32               serverSocket;   /**< The server socket for Modbus TCP */
     modbus_t            *ctx;           /**< The Modbus context */
