@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/fb.h>
-#include <linux/input.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -17,11 +16,16 @@
 
 #include <lvgl.h>
 
-/* LVGL 9 removed lv_disp_drv_t / lv_indev_drv_t; use lv_display_t / lv_indev_t instead. */
-#if defined(LVGL_VERSION_MAJOR) && (LVGL_VERSION_MAJOR >= 9)
-#define LVGL_PORT_USE_V9 1
-#else
-#define LVGL_PORT_USE_V9 0
+#if !defined(LVGL_VERSION_MAJOR) || (LVGL_VERSION_MAJOR < 9)
+#error "Main_Process LVGL port requires LVGL 9 or newer."
+#endif
+
+#ifndef LV_USE_EVDEV
+#define LV_USE_EVDEV 0
+#endif
+
+#if !LV_USE_EVDEV
+#include <linux/input.h>
 #endif
 
 static int s_fbFd = -1;
@@ -30,6 +34,7 @@ static uint32_t s_fbLineLen = 0;
 static struct fb_var_screeninfo s_vinfo;
 static struct fb_fix_screeninfo s_finfo;
 
+#if !LV_USE_EVDEV
 static int s_touchFd = -1;
 static int32_t s_touchX = 0;
 static int32_t s_touchY = 0;
@@ -38,13 +43,12 @@ static int32_t s_touchXMax = 4095;
 static int32_t s_touchYMin = 0;
 static int32_t s_touchYMax = 4095;
 static UINT8 s_touchPressed = 0U;
+#endif
 
 static uint32_t s_lastTickMs = 0U;
 
-#if LVGL_PORT_USE_V9
 static lv_display_t *s_disp = NULL;
 static lv_indev_t *s_indev = NULL;
-#endif
 
 static uint32_t monotonicMs(void)
 {
@@ -101,9 +105,7 @@ static void fb_write_pixel_u32(int32_t x, int32_t y, uint32_t argb_or_xrgb)
     }
 }
 
-#if LVGL_PORT_USE_V9
-
-static void fbdev_flush_v9(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+static void fbdev_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     lv_color_format_t cf = lv_display_get_color_format(disp);
     uint32_t w = (uint32_t)lv_area_get_width(area);
@@ -151,47 +153,41 @@ static void fbdev_flush_v9(lv_display_t *disp, const lv_area_t *area, uint8_t *p
     lv_display_flush_ready(disp);
 }
 
-#else
-
-static void fbdev_flush_v8(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p)
+#if LV_USE_EVDEV
+/* Matches Yocto_LVGL_Experiments: lv_evdev_create + lv_indev_set_display; path from config touchDev. */
+static ERROR_CODE lv_linux_init_input_pointer(lv_display_t *disp, const CHAR *input_device)
 {
-    int32_t x = 0;
-    int32_t y = 0;
+    lv_indev_t *touch;
 
-    (void)disp_drv;
-
-    for (y = area->y1; y <= area->y2; y++)
+    if (input_device == NULL)
     {
-        for (x = area->x1; x <= area->x2; x++)
+        fprintf(stderr, "LVGL: touch input device path is NULL\n");
+        return RET_FAILURE;
+    }
+
+    touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, input_device);
+    if (touch == NULL)
+    {
+        fprintf(stderr, "LVGL: lv_evdev_create failed for %s\n", input_device);
+        return RET_FAILURE;
+    }
+
+    lv_indev_set_display(touch, disp);
+    s_indev = touch;
+
+    {
+        lv_timer_t *indev_timer = lv_indev_get_read_timer(touch);
+        if (indev_timer != NULL)
         {
-            if (s_vinfo.bits_per_pixel == 16)
-            {
-                *((uint16_t *)(s_fbMem + ((x + s_vinfo.xoffset) * (s_vinfo.bits_per_pixel / 8) +
-                                          (y + s_vinfo.yoffset) * (long int)s_fbLineLen))) =
-                    lv_color_to_u16(*color_p);
-            }
-            else if (s_vinfo.bits_per_pixel == 32)
-            {
-                lv_color32_t c32 = lv_color_to_32(*color_p);
-                uint32_t v = ((uint32_t)c32.ch.red << 16) | ((uint32_t)c32.ch.green << 8) | (uint32_t)c32.ch.blue;
-                *((uint32_t *)(s_fbMem + ((x + s_vinfo.xoffset) * (s_vinfo.bits_per_pixel / 8) +
-                                          (y + s_vinfo.yoffset) * (long int)s_fbLineLen))) = v;
-            }
-            else
-            {
-                *((uint16_t *)(s_fbMem + ((x + s_vinfo.xoffset) * (s_vinfo.bits_per_pixel / 8) +
-                                          (y + s_vinfo.yoffset) * (long int)s_fbLineLen))) =
-                    lv_color_to_u16(*color_p);
-            }
-            color_p++;
+            lv_timer_set_period(indev_timer, 2);
         }
     }
 
-    lv_disp_flush_ready(disp_drv);
+    return RET_OK;
 }
-
 #endif
 
+#if !LV_USE_EVDEV
 static void touch_poll_events(VOID)
 {
     struct input_event ev;
@@ -260,40 +256,20 @@ static void touch_fill_pointer(lv_indev_data_t *data)
     data->state = (s_touchPressed != 0U) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
-#if LVGL_PORT_USE_V9
-
-static void touch_read_v9(lv_indev_t *indev, lv_indev_data_t *data)
+static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
     touch_poll_events();
     touch_fill_pointer(data);
 }
-
-#else
-
-static void touch_read_v8(lv_indev_drv_t *drv, lv_indev_data_t *data)
-{
-    (void)drv;
-    touch_poll_events();
-    touch_fill_pointer(data);
-}
-
 #endif
 
 ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
 {
     lv_coord_t buf_lines = 40;
     uint32_t buf_pixels = 0U;
-
-#if LVGL_PORT_USE_V9
     uint8_t *buf1 = NULL;
     uint32_t buf_bytes = 0U;
-#else
-    static lv_disp_draw_buf_t draw_buf;
-    static lv_disp_drv_t disp_drv;
-    static lv_indev_drv_t indev_drv;
-    lv_color_t *buf1 = NULL;
-#endif
 
     if ((fbdevPath == NULL) || (touchDevPath == NULL))
     {
@@ -335,9 +311,6 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
         return RET_FAILURE;
     }
 
-    buf_pixels = (uint32_t)s_vinfo.xres * (uint32_t)buf_lines;
-
-#if LVGL_PORT_USE_V9
     s_disp = lv_display_create((int32_t)s_vinfo.xres, (int32_t)s_vinfo.yres);
     if (s_disp == NULL)
     {
@@ -362,11 +335,27 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
         lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
     }
 
+    /* Partial refresh buffer: cap height so malloc + LVGL's internal heap stay viable on
+     * small-RAM targets. Very tall buffers steal RAM from lv_malloc (draw layers, etc.). */
+    buf_lines = (lv_coord_t)s_vinfo.yres;
+    if (buf_lines > 120)
     {
-        uint32_t bppcf = (uint32_t)lv_color_format_get_bpp(lv_display_get_color_format(s_disp));
-        buf_bytes = buf_pixels * ((bppcf + 7U) / 8U);
+        buf_lines = 120;
     }
-    buf1 = (uint8_t *)malloc(buf_bytes);
+    while (buf_lines >= 40)
+    {
+        buf_pixels = (uint32_t)s_vinfo.xres * (uint32_t)buf_lines;
+        {
+            uint32_t bppcf = (uint32_t)lv_color_format_get_bpp(lv_display_get_color_format(s_disp));
+            buf_bytes = buf_pixels * ((bppcf + 7U) / 8U);
+        }
+        buf1 = (uint8_t *)malloc(buf_bytes);
+        if (buf1 != NULL)
+        {
+            break;
+        }
+        buf_lines = (lv_coord_t)((int32_t)buf_lines / 2);
+    }
     if (buf1 == NULL)
     {
         fprintf(stderr, "LVGL: draw buffer alloc failed\n");
@@ -380,40 +369,28 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
     }
 
     lv_display_set_buffers(s_disp, buf1, NULL, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_flush_cb(s_disp, fbdev_flush_v9);
-#else
-    buf1 = (lv_color_t *)malloc(sizeof(lv_color_t) * buf_pixels);
-    if (buf1 == NULL)
+    lv_display_set_flush_cb(s_disp, fbdev_flush);
+
+#if LV_USE_EVDEV
+    if (lv_linux_init_input_pointer(s_disp, touchDevPath) != RET_OK)
     {
-        fprintf(stderr, "LVGL: draw buffer alloc failed\n");
+        free(buf1);
+        lv_display_delete(s_disp);
+        s_disp = NULL;
         munmap(s_fbMem, s_finfo.smem_len);
         s_fbMem = NULL;
         close(s_fbFd);
         s_fbFd = -1;
         return RET_FAILURE;
     }
-
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, (uint32_t)(buf_pixels));
-
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = (lv_coord_t)s_vinfo.xres;
-    disp_drv.ver_res = (lv_coord_t)s_vinfo.yres;
-    disp_drv.flush_cb = fbdev_flush_v8;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
-#endif
-
+#else
     s_touchFd = open(touchDevPath, O_RDONLY | O_NONBLOCK);
     if (s_touchFd < 0)
     {
         fprintf(stderr, "LVGL: cannot open touch device %s: %s\n", touchDevPath, strerror(errno));
-#if LVGL_PORT_USE_V9
         free(buf1);
         lv_display_delete(s_disp);
         s_disp = NULL;
-#else
-        free(buf1);
-#endif
         munmap(s_fbMem, s_finfo.smem_len);
         s_fbMem = NULL;
         close(s_fbFd);
@@ -436,7 +413,6 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
         }
     }
 
-#if LVGL_PORT_USE_V9
     s_indev = lv_indev_create();
     if (s_indev == NULL)
     {
@@ -454,12 +430,14 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
     }
     lv_indev_set_type(s_indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_display(s_indev, s_disp);
-    lv_indev_set_read_cb(s_indev, touch_read_v9);
-#else
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = touch_read_v8;
-    lv_indev_drv_register(&indev_drv);
+    lv_indev_set_read_cb(s_indev, touch_read);
+    {
+        lv_timer_t *indev_timer = lv_indev_get_read_timer(s_indev);
+        if (indev_timer != NULL)
+        {
+            lv_timer_set_period(indev_timer, 2);
+        }
+    }
 #endif
 
     s_lastTickMs = monotonicMs();

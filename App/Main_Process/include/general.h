@@ -47,11 +47,16 @@
 #define MQTT_MODE_MANUAL        "MANUAL"
 
 #define MQTT_TOPIC_CMD_MODE         "smarthome/cmd/mode"
+#define MQTT_TOPIC_CMD_R1_MODE      "smarthome/cmd/room1/mode"
+#define MQTT_TOPIC_CMD_R2_MODE      "smarthome/cmd/room2/mode"
 #define MQTT_TOPIC_CMD_R1_LIGHT     "smarthome/cmd/room1/light"
 #define MQTT_TOPIC_CMD_R1_FAN       "smarthome/cmd/room1/fan"
 #define MQTT_TOPIC_CMD_R2_LIGHT     "smarthome/cmd/room2/light"
 #define MQTT_TOPIC_CMD_R2_AC        "smarthome/cmd/room2/ac"
 #define MQTT_TOPIC_STATE_MODE       "smarthome/state/mode"
+#define MQTT_TOPIC_STATE_R1_MODE    "smarthome/state/room1/mode"
+#define MQTT_TOPIC_STATE_R2_MODE    "smarthome/state/room2/mode"
+#define MQTT_MODE_MIXED             "MIXED"
 #define MQTT_TOPIC_STATE_R1_PIR     "smarthome/state/room1/pir"
 #define MQTT_TOPIC_STATE_R1_LIGHT   "smarthome/state/room1/light"
 #define MQTT_TOPIC_STATE_R1_FAN     "smarthome/state/room1/fan"
@@ -122,7 +127,8 @@ typedef struct
     UINT8               pir[MAX_SENS_SIMULATOR];
     UINT8               outputState[MAX_SENS_SIMULATOR];
     UINT8               manualState[MAX_SENS_SIMULATOR];
-    UINT8               isAutoMode;
+    UINT8               isAutoModeRoom1;
+    UINT8               isAutoModeRoom2;
     UINT64              lastPirPollTs[MAX_SENS_SIMULATOR];
     UINT64              lastDataPubTs;
     UINT64              lastStatePubTs;

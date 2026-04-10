@@ -5,19 +5,30 @@
 
 typedef struct
 {
-    UINT8   isAutoMode;
+    UINT8   isAutoModeRoom1;
+    UINT8   isAutoModeRoom2;
+    UINT8   mqttConnected;
+    UINT8   modbusConnectedCount;
+    UINT8   modbusTotalDevices;
     UINT8   pirRoom1;
     UINT8   pirRoom2;
     UINT8   room1Light;
     UINT8   room1Fan;
     UINT8   room2Light;
     UINT8   room2AC;
+    UINT16  room1LightPowerW;
+    UINT16  room1FanPowerW;
+    UINT16  room2LightPowerW;
+    UINT16  room2ACPowerW;
+    UINT16  room2FridgePowerW;
 } UI_STATE;
 
 typedef struct
 {
-    UINT8   hasMode;
-    UINT8   isAutoMode;
+    UINT8   hasRoom1Mode;
+    UINT8   room1Auto;
+    UINT8   hasRoom2Mode;
+    UINT8   room2Auto;
     UINT8   hasRoom1Light;
     UINT8   room1Light;
     UINT8   hasRoom1Fan;

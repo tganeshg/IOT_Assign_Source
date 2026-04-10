@@ -71,4 +71,4 @@ fi
 sleep 1
 
 # Foreground: when main exits, EXIT trap stops simulators.
-"$MAIN_BIN" -d -n 7
+"$MAIN_BIN" -n 7

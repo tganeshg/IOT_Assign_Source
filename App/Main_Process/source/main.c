@@ -17,6 +17,7 @@
 /*** Includes ***/
 #include "general.h"
 #include "ui_lvgl.h"
+#include <sched.h>
 
 #define	CUR_SENS_SIMULATOR	curSs
 #define MODBUS_DEBUG		modDebug
@@ -478,6 +479,8 @@ static void on_connect(struct mosquitto *mosq, void *obj, int rc)
 	{
 		SET_FLAG(MQTT_CONNECTED);
         mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_MODE, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R1_MODE, 0);
+        mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R2_MODE, 0);
         mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R1_LIGHT, 0);
         mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R1_FAN, 0);
         mosquitto_subscribe(mosq, NULL, MQTT_TOPIC_CMD_R2_LIGHT, 0);
@@ -559,7 +562,19 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
 
     if (strcmp(msg->topic, MQTT_TOPIC_CMD_MODE) == 0)
     {
-        mpInst.isAutoMode = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        BOOL autoOn = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        mpInst.isAutoModeRoom1 = autoOn;
+        mpInst.isAutoModeRoom2 = autoOn;
+        return;
+    }
+    if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_MODE) == 0)
+    {
+        mpInst.isAutoModeRoom1 = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        return;
+    }
+    if (strcmp(msg->topic, MQTT_TOPIC_CMD_R2_MODE) == 0)
+    {
+        mpInst.isAutoModeRoom2 = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
         return;
     }
     if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_LIGHT) == 0)
@@ -581,17 +596,24 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
 *************************************************************************/
 static VOID applyControlPolicy(VOID)
 {
-    if (mpInst.isAutoMode)
+    if (mpInst.isAutoModeRoom1)
     {
         mpInst.outputState[IDX_LMC1] = mpInst.pir[IDX_HD1];
         mpInst.outputState[IDX_FMC1] = mpInst.pir[IDX_HD1];
-        mpInst.outputState[IDX_LMC2] = mpInst.pir[IDX_HD2];
-        mpInst.outputState[IDX_AC2] = mpInst.pir[IDX_HD2];
     }
     else
     {
         mpInst.outputState[IDX_LMC1] = mpInst.manualState[IDX_LMC1];
         mpInst.outputState[IDX_FMC1] = mpInst.manualState[IDX_FMC1];
+    }
+
+    if (mpInst.isAutoModeRoom2)
+    {
+        mpInst.outputState[IDX_LMC2] = mpInst.pir[IDX_HD2];
+        mpInst.outputState[IDX_AC2] = mpInst.pir[IDX_HD2];
+    }
+    else
+    {
         mpInst.outputState[IDX_LMC2] = mpInst.manualState[IDX_LMC2];
         mpInst.outputState[IDX_AC2] = mpInst.manualState[IDX_AC2];
     }
@@ -611,8 +633,10 @@ static VOID applyUICommands(VOID)
     if (uiFetchCommands(&cmd) != RET_OK)
         return;
 
-    if (cmd.hasMode)
-        mpInst.isAutoMode = cmd.isAutoMode ? TRUE : FALSE;
+    if (cmd.hasRoom1Mode)
+        mpInst.isAutoModeRoom1 = cmd.room1Auto ? TRUE : FALSE;
+    if (cmd.hasRoom2Mode)
+        mpInst.isAutoModeRoom2 = cmd.room2Auto ? TRUE : FALSE;
 
     if (cmd.hasRoom1Light)
         mpInst.manualState[IDX_LMC1] = cmd.room1Light ? 1U : 0U;
@@ -636,7 +660,8 @@ static void printUsage(void)
     fprintf(stdout,"Usage: ems_mainProc [OPTIONS]\n");
     fprintf(stdout,"Options:\n");
     fprintf(stdout,"  -n <max sensor>       Max number of sensor simulator(Upto 7)\n");
-    fprintf(stdout,"  -d                    Enable debug\n");
+    fprintf(stdout,"  -d                    Enable basic DEBUG_LOG\n");
+    fprintf(stdout,"  -m                    Enable Modbus logs\n");
     fprintf(stdout,"  -h, --help            Show this help message and exit\n");
 }
 
@@ -658,7 +683,7 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
     time_t nowTs = 0;
     UINT64 nowMs = 0;
 
-	while((rc = getopt(argc, argv, "n:h:d")) != RET_FAILURE)
+	while((rc = getopt(argc, argv, "n:hdm")) != RET_FAILURE)
     {
         switch (rc)
         {
@@ -666,7 +691,10 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                 curSs = (UINT16)atoi(optarg);
             break;
             case 'd':
-				modDebug = debug = TRUE;
+				debug = TRUE;
+            break;
+            case 'm':
+				modDebug = TRUE;
             break;
             case 'h':
                 printUsage();
@@ -691,6 +719,12 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 
     while(mpInst.state != STATE_ERROR)
     {
+        /* Keep LVGL responsive on every state (sample pattern: pump timers often). */
+        if (mpInst.state != STATE_INIT)
+        {
+            uiProcess();
+        }
+
         switch(mpInst.state)
         {
             case STATE_INIT:
@@ -792,8 +826,11 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
             break;
 			case STATE_CONNECT_MQTT:
 			{
-				sleep(1);
-				mpInst.state = (CHECK_FLAG(MQTT_CONNECTED)) ? STATE_CONNECT_MODBUS : STATE_CONNECT_MQTT;
+				uiProcess();
+				if (CHECK_FLAG(MQTT_CONNECTED))
+					mpInst.state = STATE_CONNECT_MODBUS;
+				else
+					(void)sched_yield();
 			}
 			break;
             case STATE_CONNECT_MODBUS:
@@ -801,8 +838,8 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                 UI_STATE uiState;
                 memset(&uiState, 0, sizeof(uiState));
 
-                uiProcess();
                 applyUICommands();
+                uiProcess();
 
                 for(idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
                 {
@@ -836,9 +873,11 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                                 mpInst.mConnected[idx] = FALSE;
                         }
                     }
+                    uiProcess();
                 }
 
                 applyControlPolicy();
+                uiProcess();
                 for (idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
                 {
                     if (mpInst.mConnected[idx] && isControlIndex(idx))
@@ -846,15 +885,33 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                         if (writeModbusCoil(mpInst.ctx[idx], MODBUS_COIL_ADDR_WRITE, mpInst.outputState[idx]) != RET_OK)
                             mpInst.mConnected[idx] = FALSE;
                     }
+                    uiProcess();
                 }
 
-                uiState.isAutoMode = mpInst.isAutoMode;
+                uiState.isAutoModeRoom1 = mpInst.isAutoModeRoom1 ? 1U : 0U;
+                uiState.isAutoModeRoom2 = mpInst.isAutoModeRoom2 ? 1U : 0U;
+                uiState.mqttConnected = CHECK_FLAG(MQTT_CONNECTED) ? 1U : 0U;
+                uiState.modbusConnectedCount = 0U;
+                uiState.modbusTotalDevices = CUR_SENS_SIMULATOR;
                 uiState.pirRoom1 = mpInst.pir[IDX_HD1];
                 uiState.pirRoom2 = mpInst.pir[IDX_HD2];
                 uiState.room1Light = mpInst.outputState[IDX_LMC1];
                 uiState.room1Fan = mpInst.outputState[IDX_FMC1];
                 uiState.room2Light = mpInst.outputState[IDX_LMC2];
                 uiState.room2AC = mpInst.outputState[IDX_AC2];
+                uiState.room1LightPowerW = mpInst.outputState[IDX_LMC1] ? mpInst.power[IDX_LMC1] : 0U;
+                uiState.room1FanPowerW = mpInst.outputState[IDX_FMC1] ? mpInst.power[IDX_FMC1] : 0U;
+                uiState.room2LightPowerW = mpInst.outputState[IDX_LMC2] ? mpInst.power[IDX_LMC2] : 0U;
+                uiState.room2ACPowerW = mpInst.outputState[IDX_AC2] ? mpInst.power[IDX_AC2] : 0U;
+                if (CUR_SENS_SIMULATOR > IDX_RM2 && mpInst.mConnected[IDX_RM2])
+                    uiState.room2FridgePowerW = mpInst.power[IDX_RM2];
+                else
+                    uiState.room2FridgePowerW = 0U;
+                for (idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
+                {
+                    if (mpInst.mConnected[idx] == TRUE)
+                        uiState.modbusConnectedCount++;
+                }
                 uiUpdateState(&uiState);
 
                 mpInst.state = STATE_INSERT_DB;
@@ -866,26 +923,43 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                 {
                     if(mpInst.mConnected[idx] && !isPIRIndex(idx))
                         insertDB(mpInst.db, (idx + 1), mpInst.power[idx]);
+                    uiProcess();
                 }
                 mpInst.state = STATE_PUBLISH_MQTT;
 			}
             break;
             case STATE_PUBLISH_MQTT:
 			{
+                uiProcess();
                 nowTs = time(NULL);
                 if ((mpInst.lastDataPubTs == 0U) || ((UINT64)nowTs - mpInst.lastDataPubTs >= mpInst.args.publishInterval))
                 {
+                    uiProcess();
                     if(publishMQTT(mpInst.mosq, mpInst.db, mpInst.args.publishInterval) != RET_OK)
                     {
                         mpInst.state = STATE_ERROR;
                         break;
                     }
                     mpInst.lastDataPubTs = (UINT64)nowTs;
+                    uiProcess();
                 }
 
                 if ((mpInst.lastStatePubTs == 0U) || ((UINT64)nowTs - mpInst.lastStatePubTs >= mpInst.args.statePublishInterval))
                 {
-                    publishStateTopic(MQTT_TOPIC_STATE_MODE, mpInst.isAutoMode ? MQTT_MODE_AUTO : MQTT_MODE_MANUAL);
+                    uiProcess();
+                    if (mpInst.isAutoModeRoom1 == mpInst.isAutoModeRoom2)
+                    {
+                        publishStateTopic(MQTT_TOPIC_STATE_MODE,
+                                          mpInst.isAutoModeRoom1 ? MQTT_MODE_AUTO : MQTT_MODE_MANUAL);
+                    }
+                    else
+                    {
+                        publishStateTopic(MQTT_TOPIC_STATE_MODE, MQTT_MODE_MIXED);
+                    }
+                    publishStateTopic(MQTT_TOPIC_STATE_R1_MODE,
+                                      mpInst.isAutoModeRoom1 ? MQTT_MODE_AUTO : MQTT_MODE_MANUAL);
+                    publishStateTopic(MQTT_TOPIC_STATE_R2_MODE,
+                                      mpInst.isAutoModeRoom2 ? MQTT_MODE_AUTO : MQTT_MODE_MANUAL);
                     publishStateTopic(MQTT_TOPIC_STATE_R1_PIR, mpInst.pir[IDX_HD1] ? "1" : "0");
                     publishStateTopic(MQTT_TOPIC_STATE_R2_PIR, mpInst.pir[IDX_HD2] ? "1" : "0");
                     publishStateTopic(MQTT_TOPIC_STATE_R1_LIGHT, mpInst.outputState[IDX_LMC1] ? "1" : "0");
@@ -893,9 +967,10 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                     publishStateTopic(MQTT_TOPIC_STATE_R2_LIGHT, mpInst.outputState[IDX_LMC2] ? "1" : "0");
                     publishStateTopic(MQTT_TOPIC_STATE_R2_AC, mpInst.outputState[IDX_AC2] ? "1" : "0");
                     mpInst.lastStatePubTs = (UINT64)nowTs;
+                    uiProcess();
                 }
 
-                usleep(100000U);
+                uiProcess();
                 mpInst.state = STATE_CONNECT_MODBUS;
 			}
             break;

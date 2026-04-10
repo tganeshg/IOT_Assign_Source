@@ -2,6 +2,10 @@
 
 This document explains the complete behavior of the `SensorSimulator` application.
 
+The **Main Process** (`mainProc`) connects to these simulators over Modbus TCP and drives the smart-home UI and MQTT. See [`../Main_Process/MAIN_PROCESS.md`](../Main_Process/MAIN_PROCESS.md) for integration, config, and topics.
+
+---
+
 ## 1) Launch and Config
 
 Run the simulator with:
@@ -80,7 +84,7 @@ Common Modbus functions used by main process:
 - On each Modbus request, simulator reads GPIO value and updates coil `1000`:
   - GPIO HIGH -> coil `1`
   - GPIO LOW -> coil `0`
-- Main process can poll coil `1000` every 500 ms for quick PIR status.
+- Main process polls coil `1000` on an interval configured per device in `config_MP.ini` (`pirPollMs`, typically **100–5000** ms; example configs often use **500** ms).
 - Write coil is not allowed for PIR mode (illegal function response).
 - No power value is exposed for PIR mode (coil-only behavior).
 
@@ -93,11 +97,12 @@ Common Modbus functions used by main process:
 - Coil `1000` mirrors current control state for readback.
 - Power is also available through holding register `3000`.
 
-### C) Monitoring-only Sensor (`sensorID 7`)
+### C) Monitoring-only Sensor (`sensorID 7`, RM_2 / refrigerator)
 
 - No control feature.
 - No coil feature exposed.
 - Only power monitoring via holding register `3000`.
+- The main process maps this to **Room 2** UI (fridge power line on the mode row). There is no separate Room 1 fridge simulator in the default layout.
 
 ---
 
@@ -134,4 +139,35 @@ ConfigGPIO = 5
 debug = 1
 modbusDebug = 0
 ```
+
+---
+
+## 9) Real PIR sensor and LEDs (hardware)
+
+The same `SensorSimulator` binary can drive **real GPIO** on Linux (e.g. Raspberry Pi / embedded board). **`mainProc` does not need changes** for GPIO: it still uses Modbus TCP; only the simulator’s **physical layer** changes from “simulated values” to **PIR input** and **LED outputs**.
+
+### PIR (motion) — `sensorID` **1** or **4** (`HD_1`, `HD_2`)
+
+- `ConfigGPIO` selects a **GPIO used as input** via `/sys/class/gpio` (use the **pin number your kernel expects**, often **BCM** on Raspberry Pi—check your board’s GPIO map).
+- On each Modbus read of coil **1000**, the simulator samples the pin: **HIGH → coil 1**, **LOW → coil 0** (motion / no motion depends on your PIR module’s idle output level—some are active-high on motion).
+- Wire the PIR **data** pin to that GPIO (and **GND** / **3.3 V** or **5 V** per module datasheet). If the sensor is **5 V** output and the SoC is **3.3 V** input, use a **level shifter** or a compatible divider—do not exceed the CPU’s `Vih` max.
+- Optional: enable internal pull-up/pull-down in software or add an external resistor if the line floats.
+
+### LEDs (stand-in for Light / Fan / AC) — `sensorID` **2, 3, 5, 6**
+
+- For these control sensors, `ConfigGPIO` is an **output**: **main process** writes Modbus coil **5000** (`1` = ON, `0` = OFF); the simulator drives the pin **HIGH/LOW** accordingly (same as driving an LED or relay).
+- Use a **current-limiting resistor** in series with each LED (typ. a few hundred Ω at 3.3 V, value depends on LED colour and desired brightness). For **relays/mains loads**, drive a transistor or relay module instead of wiring the LED directly if current exceeds GPIO spec.
+
+### Summary
+
+| Role        | sensorID | GPIO direction | Modbus (simulator) |
+|------------|----------|----------------|---------------------|
+| PIR room 1 | 1        | **in**         | Read coil **1000**  |
+| PIR room 2 | 4        | **in**         | Read coil **1000**  |
+| Light R1   | 2        | **out**        | Write coil **5000** |
+| Fan R1     | 3        | **out**        | Write coil **5000** |
+| Light R2   | 5        | **out**        | Write coil **5000** |
+| AC R2      | 6        | **out**        | Write coil **5000** |
+
+Run **one** `SensorSimulator` process per `sensorID` with its own `modbusPort` and `ConfigGPIO`, matching `config_MP.ini` on the main process (same as pure software simulation).
 
