@@ -172,3 +172,15 @@ The same `SensorSimulator` binary can drive **real GPIO** on Linux (e.g. Raspber
 
 Run **one** `SensorSimulator` process per `sensorID` with its own `modbusPort` and `ConfigGPIO`, matching `config_MP.ini` on the main process (same as pure software simulation).
 
+### Example: Room 2 GPIO mapping (BCM)
+
+One deployed layout uses:
+
+| Role | Simulator | `ConfigGPIO` | Notes |
+|------|-------------|--------------|--------|
+| PIR | `HD_2` (`sensorID` 4) | **6** | Motion input |
+| Light (LED) | `LMC_2` (`sensorID` 5) | **19** | Control output |
+| AC (LED) | `AMC_2` (`sensorID` 6) | **26** | Control output |
+
+The checked-in `config_HD_2.ini`, `config_LMC_2.ini`, and `config_AMC_2.ini` match these values; change `ConfigGPIO` if your board uses different pins.
+
