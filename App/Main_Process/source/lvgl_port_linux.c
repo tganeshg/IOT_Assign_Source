@@ -60,6 +60,11 @@ static uint32_t monotonicMs(void)
 static void fb_write_pixel(int32_t x, int32_t y, uint16_t rgb565)
 {
     long int loc = 0;
+    int32_t xres = (int32_t)s_vinfo.xres;
+    int32_t yres = (int32_t)s_vinfo.yres;
+
+    if (x < 0 || y < 0 || x >= xres || y >= yres)
+        return;
 
     loc = (x + (int32_t)s_vinfo.xoffset) * ((int32_t)s_vinfo.bits_per_pixel / 8) +
           (y + (int32_t)s_vinfo.yoffset) * (long int)s_fbLineLen;
@@ -87,6 +92,11 @@ static void fb_write_pixel(int32_t x, int32_t y, uint16_t rgb565)
 static void fb_write_pixel_u32(int32_t x, int32_t y, uint32_t argb_or_xrgb)
 {
     long int loc = 0;
+    int32_t xres = (int32_t)s_vinfo.xres;
+    int32_t yres = (int32_t)s_vinfo.yres;
+
+    if (x < 0 || y < 0 || x >= xres || y >= yres)
+        return;
 
     loc = (x + (int32_t)s_vinfo.xoffset) * ((int32_t)s_vinfo.bits_per_pixel / 8) +
           (y + (int32_t)s_vinfo.yoffset) * (long int)s_fbLineLen;
@@ -153,6 +163,30 @@ static void fbdev_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_m
     lv_display_flush_ready(disp);
 }
 
+/*
+ * Scroll limit: higher = more movement before LVGL treats gesture as scroll (helps light taps).
+ * Long-press: lower = faster secondary actions.
+ */
+#define LVGL_INDEV_SCROLL_LIMIT_PX  32
+#define LVGL_INDEV_LONG_PRESS_MS      260
+
+/* Any reported pressure at/above this counts as contact (light taps; device max is often 255). */
+#define TOUCH_PRESSURE_MIN            1
+
+/* 1 ms poll + scroll/long-press tuned for embedded touch (inconsistent BTN_TOUCH / pressure). */
+static void indev_apply_responsive_touch(lv_indev_t *indev)
+{
+    lv_timer_t *t;
+
+    if (indev == NULL)
+        return;
+    t = lv_indev_get_read_timer(indev);
+    if (t != NULL)
+        lv_timer_set_period(t, 1);
+    lv_indev_set_scroll_limit(indev, LVGL_INDEV_SCROLL_LIMIT_PX);
+    lv_indev_set_long_press_time(indev, LVGL_INDEV_LONG_PRESS_MS);
+}
+
 #if LV_USE_EVDEV
 /* Matches Yocto_LVGL_Experiments: lv_evdev_create + lv_indev_set_display; path from config touchDev. */
 static ERROR_CODE lv_linux_init_input_pointer(lv_display_t *disp, const CHAR *input_device)
@@ -174,14 +208,7 @@ static ERROR_CODE lv_linux_init_input_pointer(lv_display_t *disp, const CHAR *in
 
     lv_indev_set_display(touch, disp);
     s_indev = touch;
-
-    {
-        lv_timer_t *indev_timer = lv_indev_get_read_timer(touch);
-        if (indev_timer != NULL)
-        {
-            lv_timer_set_period(indev_timer, 2);
-        }
-    }
+    indev_apply_responsive_touch(touch);
 
     return RET_OK;
 }
@@ -193,25 +220,50 @@ static void touch_poll_events(VOID)
     struct input_event ev;
     ssize_t n = 0;
 
+    /*
+     * Many panels are inconsistent with BTN_TOUCH on light taps. Also handle:
+     * - ABS_MT_TRACKING_ID (capacitive MT): >=0 contact, -1 lift
+     * - ABS_PRESSURE / ABS_MT_PRESSURE: non-zero => contact
+     * - BTN_TOOL_FINGER: some controllers use this for contact
+     * Drain the full queue each LVGL read so the last event wins.
+     */
     while ((n = read(s_touchFd, &ev, sizeof(ev))) == (ssize_t)sizeof(ev))
     {
         if (ev.type == EV_ABS)
         {
-            if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X)
+            switch (ev.code)
             {
+            case ABS_X:
                 s_touchX = ev.value;
-            }
-            else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y)
-            {
+                break;
+            case ABS_Y:
                 s_touchY = ev.value;
+                break;
+            case ABS_MT_POSITION_X:
+                s_touchX = ev.value;
+                break;
+            case ABS_MT_POSITION_Y:
+                s_touchY = ev.value;
+                break;
+            case ABS_MT_TRACKING_ID:
+                if (ev.value < 0)
+                    s_touchPressed = 0U;
+                else
+                    s_touchPressed = 1U;
+                break;
+            case ABS_PRESSURE:
+            case ABS_MT_PRESSURE:
+                if (ev.value >= TOUCH_PRESSURE_MIN)
+                    s_touchPressed = 1U;
+                break;
+            default:
+                break;
             }
         }
         else if (ev.type == EV_KEY)
         {
-            if (ev.code == BTN_TOUCH || ev.code == BTN_LEFT)
-            {
+            if (ev.code == BTN_TOUCH || ev.code == BTN_LEFT || ev.code == BTN_TOOL_FINGER)
                 s_touchPressed = (ev.value != 0) ? 1U : 0U;
-            }
         }
     }
 }
@@ -295,6 +347,14 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
     if (ioctl(s_fbFd, FBIOGET_VSCREENINFO, &s_vinfo) < 0)
     {
         fprintf(stderr, "LVGL: FBIOGET_VSCREENINFO failed: %s\n", strerror(errno));
+        close(s_fbFd);
+        s_fbFd = -1;
+        return RET_FAILURE;
+    }
+
+    if (s_vinfo.xres == 0U || s_vinfo.yres == 0U || s_vinfo.xres > 8192U || s_vinfo.yres > 8192U)
+    {
+        fprintf(stderr, "LVGL: invalid fb resolution %ux%u\n", (unsigned)s_vinfo.xres, (unsigned)s_vinfo.yres);
         close(s_fbFd);
         s_fbFd = -1;
         return RET_FAILURE;
@@ -431,13 +491,7 @@ ERROR_CODE lv_port_linux_init(const CHAR *fbdevPath, const CHAR *touchDevPath)
     lv_indev_set_type(s_indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_display(s_indev, s_disp);
     lv_indev_set_read_cb(s_indev, touch_read);
-    {
-        lv_timer_t *indev_timer = lv_indev_get_read_timer(s_indev);
-        if (indev_timer != NULL)
-        {
-            lv_timer_set_period(indev_timer, 2);
-        }
-    }
+    indev_apply_responsive_touch(s_indev);
 #endif
 
     s_lastTickMs = monotonicMs();

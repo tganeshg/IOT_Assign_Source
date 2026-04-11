@@ -12,6 +12,9 @@ typedef struct
     UINT8   modbusTotalDevices;
     UINT8   pirRoom1;
     UINT8   pirRoom2;
+    /* Auto: alternate-motion “occupied” (matches loads); Manual: raw PIR for this column. */
+    UINT8   personOccupiedRoom1;
+    UINT8   personOccupiedRoom2;
     UINT8   room1Light;
     UINT8   room1Fan;
     UINT8   room2Light;

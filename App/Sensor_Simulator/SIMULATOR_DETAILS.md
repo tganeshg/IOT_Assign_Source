@@ -85,6 +85,7 @@ Common Modbus functions used by main process:
   - GPIO HIGH -> coil `1`
   - GPIO LOW -> coil `0`
 - Main process polls coil `1000` on an interval configured per device in `config_MP.ini` (`pirPollMs`, typically **100–5000** ms; example configs often use **500** ms).
+- In **Auto** mode, `mainProc` does **not** map “coil high = loads on” directly: it uses **rising-edge (0→1) detections** to **alternate** loads ON/OFF, with debounce from **`pirVacancySec`** in `config_MP.ini`. The coil still reflects **raw** motion for MQTT and the UI **Motion** line; **Person In/Out** on the UI follows the alternate state in Auto (see [`../Main_Process/MAIN_PROCESS.md`](../Main_Process/MAIN_PROCESS.md) §4–§5).
 - Write coil is not allowed for PIR mode (illegal function response).
 - No power value is exposed for PIR mode (coil-only behavior).
 

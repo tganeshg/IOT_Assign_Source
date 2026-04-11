@@ -38,7 +38,11 @@
 #define MAX_MQTT_PUB_INTERVAL	59
 #define MIN_PIR_POLL_MS         100
 #define MAX_PIR_POLL_MS         5000
+/* Auto mode: min seconds between alternate ON/OFF toggles (same INI key pirVacancySec); suppresses PIR retrigger spam. */
+#define PIR_TOGGLE_DEBOUNCE_SEC_DEFAULT   2U
 #define MQTT_PAYLOAD_MIN_SIZE   2
+/* Max rows per sensor/data JSON publish (fits in mpInst.payload with strcat replaced by bounded build). */
+#define MQTT_PUBLISH_JSON_MAX_ROWS   20
 
 #define CONFIG_FILE				"/home/root/config/config_MP.ini"
 #define MQTT_CLIENT_ID			"ems_main_proc"
@@ -112,6 +116,10 @@ typedef struct
     UINT16      statePublishInterval;
     CHAR        *uiFbdev;
     CHAR        *uiTouchDev;
+    UINT16      pirVacancySecR1;
+    UINT16      pirVacancySecR2;
+    UINT8       pirVacancySecSetR1; /* 1 if [HD_1] pirVacancySec was present in INI (allows 0 = off when coil reads 0) */
+    UINT8       pirVacancySecSetR2;
 }PROGRAM_ARGS;
 
 typedef struct
@@ -129,6 +137,14 @@ typedef struct
     UINT8               manualState[MAX_SENS_SIMULATOR];
     UINT8               isAutoModeRoom1;
     UINT8               isAutoModeRoom2;
+    UINT8               pirPrevCoilRoom1;     /* last PIR coil sample (rising edge = new detection) */
+    UINT8               pirPrevCoilRoom2;
+    UINT8               pirToggleLoadsOnRoom1; /* auto: alternate 1st detect ON, 2nd OFF, … */
+    UINT8               pirToggleLoadsOnRoom2;
+    UINT64              pirLastToggleMsRoom1; /* debounce between toggles */
+    UINT64              pirLastToggleMsRoom2;
+    UINT32              pirToggleMinMsRoom1;  /* from pirVacancySec INI (ms between toggles) */
+    UINT32              pirToggleMinMsRoom2;
     UINT64              lastPirPollTs[MAX_SENS_SIMULATOR];
     UINT64              lastDataPubTs;
     UINT64              lastStatePubTs;

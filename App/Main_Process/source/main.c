@@ -18,6 +18,8 @@
 #include "general.h"
 #include "ui_lvgl.h"
 #include <sched.h>
+#include <stddef.h>
+#include <string.h>
 
 #define	CUR_SENS_SIMULATOR	curSs
 #define MODBUS_DEBUG		modDebug
@@ -101,8 +103,21 @@ static int iniHandler(void* user, const char* section, const char* name, const c
 				args->sensorPort[ssIdx] = (UINT16)atoi(value);
 			else if (strcmp(name, "readInterval") == 0)
 				args->readInterval[ssIdx] = (UINT16)atoi(value);
-            else if (strcmp(name, "pirPollMs") == 0)
+			else if (strcmp(name, "pirPollMs") == 0)
                 args->pirPollMs[ssIdx] = (UINT16)atoi(value);
+            else if (strcmp(name, "pirVacancySec") == 0)
+            {
+                if (ssIdx == 0)
+                {
+                    args->pirVacancySecR1 = (UINT16)atoi(value);
+                    args->pirVacancySecSetR1 = 1U;
+                }
+                else if (ssIdx == 3)
+                {
+                    args->pirVacancySecR2 = (UINT16)atoi(value);
+                    args->pirVacancySecSetR2 = 1U;
+                }
+            }
 		}
 	}
 
@@ -320,7 +335,7 @@ static ERROR_CODE readModbusCoil(modbus_t *ctx, UINT16 address, UINT8 *state)
         fprintf(stderr, "Failed to read coil(%u): %s\n", address, modbus_strerror(errno));
         return RET_FAILURE;
     }
-    *state = coil;
+    *state = (coil != 0U) ? 1U : 0U;
     return RET_OK;
 }
 
@@ -407,8 +422,17 @@ static ERROR_CODE publishMQTT(struct mosquitto *mosq, sqlite3 *db, UINT16 publis
     sqlite3_stmt *stmt=NULL;
     CHAR temp[SIZE_256]={0};
     INT32 rc=0;
+    size_t off = 0U;
+    size_t cap = sizeof(mpInst.payload);
+    int n;
 
-    snprintf(temp, sizeof(temp), "SELECT Device_ID, Power_Consumption, Timestamp FROM SensorData WHERE Timestamp >= datetime('now', '-%d seconds');", publishInterval);
+    (void)mosq;
+
+    snprintf(temp, sizeof(temp),
+             "SELECT Device_ID, Power_Consumption, Timestamp FROM SensorData "
+             "WHERE Timestamp >= datetime('now', '-%d seconds') "
+             "ORDER BY Timestamp DESC LIMIT %d;",
+             publishInterval, MQTT_PUBLISH_JSON_MAX_ROWS);
 
     rc = sqlite3_prepare_v2(db, temp, -1, &stmt, NULL);
     if (rc != SQLITE_OK)
@@ -417,30 +441,56 @@ static ERROR_CODE publishMQTT(struct mosquitto *mosq, sqlite3 *db, UINT16 publis
         return RET_FAILURE;
     }
 
-	memset(mpInst.payload,0,sizeof(mpInst.payload));
-    strcpy(mpInst.payload, "[");
-    while((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+    memset(mpInst.payload, 0, sizeof(mpInst.payload));
+    n = snprintf(mpInst.payload, cap, "[");
+    if (n < 0 || (size_t)n >= cap)
     {
-		memset(temp,0,sizeof(temp));
-        snprintf(temp, sizeof(temp), "{\"sensorID\": %d, \"power\": %d, \"Timestamp\": \"%s\"},",
-                 sqlite3_column_int(stmt, 0),
-                 sqlite3_column_int(stmt, 1),
-                 sqlite3_column_text(stmt, 2));
-        strcat(mpInst.payload, temp);
+        sqlite3_finalize(stmt);
+        return RET_FAILURE;
+    }
+    off = (size_t)n;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+    {
+        memset(temp, 0, sizeof(temp));
+        n = snprintf(temp, sizeof(temp), "{\"sensorID\": %d, \"power\": %d, \"Timestamp\": \"%s\"},",
+                     sqlite3_column_int(stmt, 0),
+                     sqlite3_column_int(stmt, 1),
+                     sqlite3_column_text(stmt, 2));
+        if (n < 0 || (size_t)n >= sizeof(temp))
+        {
+            fprintf(stderr, "MQTT: single row JSON exceeds temp buffer\n");
+            break;
+        }
+        if (off + (size_t)n + 1U > cap)
+        {
+            if (DEBUG_LOG)
+                fprintf(stderr, "MQTT: JSON aggregate capped at %zu bytes (unexpected)\n", cap);
+            break;
+        }
+        memcpy(mpInst.payload + off, temp, (size_t)n + 1U);
+        off += (size_t)n;
     }
     sqlite3_finalize(stmt);
 
-    /* Remove the trailing comma and close the JSON array */
-    if(mpInst.payload[strlen(mpInst.payload) - 1] == ',')
-        mpInst.payload[strlen(mpInst.payload) - 1] = '\0';
-
-    strcat(mpInst.payload, "]");
-
-    if(strlen(mpInst.payload) > MQTT_PAYLOAD_MIN_SIZE) // to check if there is any data to publish
+    if (off > 1U && mpInst.payload[off - 1U] == ',')
     {
-        if((rc = mosquitto_publish(mpInst.mosq, NULL, MQTT_TOPIC, strlen(mpInst.payload), mpInst.payload, 0, false)) != MOSQ_ERR_SUCCESS)
+        mpInst.payload[off - 1U] = '\0';
+        off--;
+    }
+
+    n = snprintf(mpInst.payload + off, cap - off, "]");
+    if (n < 0 || (size_t)n >= cap - off)
+    {
+        fprintf(stderr, "MQTT: JSON close bracket overflow\n");
+        return RET_FAILURE;
+    }
+
+    if (strlen(mpInst.payload) > (size_t)MQTT_PAYLOAD_MIN_SIZE)
+    {
+        if ((rc = mosquitto_publish(mpInst.mosq, NULL, MQTT_TOPIC, (INT32)strlen(mpInst.payload), mpInst.payload, 0, false)) != MOSQ_ERR_SUCCESS)
         {
-            fprintf(stderr, "Failed to publish message: %s\n",mosquitto_strerror(rc));
+            fprintf(stderr, "Failed to publish message: %s\n", mosquitto_strerror(rc));
             return RET_FAILURE;
         }
     }
@@ -565,16 +615,27 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
         BOOL autoOn = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
         mpInst.isAutoModeRoom1 = autoOn;
         mpInst.isAutoModeRoom2 = autoOn;
+        if (autoOn)
+        {
+            mpInst.pirPrevCoilRoom1 = mpInst.pir[IDX_HD1];
+            mpInst.pirPrevCoilRoom2 = mpInst.pir[IDX_HD2];
+        }
         return;
     }
     if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_MODE) == 0)
     {
-        mpInst.isAutoModeRoom1 = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        BOOL autoOn = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        mpInst.isAutoModeRoom1 = autoOn;
+        if (autoOn)
+            mpInst.pirPrevCoilRoom1 = mpInst.pir[IDX_HD1];
         return;
     }
     if (strcmp(msg->topic, MQTT_TOPIC_CMD_R2_MODE) == 0)
     {
-        mpInst.isAutoModeRoom2 = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        BOOL autoOn = (strcasecmp(payload, MQTT_MODE_AUTO) == 0) ? TRUE : FALSE;
+        mpInst.isAutoModeRoom2 = autoOn;
+        if (autoOn)
+            mpInst.pirPrevCoilRoom2 = mpInst.pir[IDX_HD2];
         return;
     }
     if (strcmp(msg->topic, MQTT_TOPIC_CMD_R1_LIGHT) == 0)
@@ -590,7 +651,7 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
 /*************************************************************************
 * @brief        Applies the control policy.
 *
-* @details      This function applies the control policy based on the mode and PIR sensor values.
+* @details      Auto: alternate ON/OFF on each new motion detection (0->1 on PIR coil). Manual: UI/MQTT.
 *
 * @return       void
 *************************************************************************/
@@ -598,8 +659,8 @@ static VOID applyControlPolicy(VOID)
 {
     if (mpInst.isAutoModeRoom1)
     {
-        mpInst.outputState[IDX_LMC1] = mpInst.pir[IDX_HD1];
-        mpInst.outputState[IDX_FMC1] = mpInst.pir[IDX_HD1];
+        mpInst.outputState[IDX_LMC1] = mpInst.pirToggleLoadsOnRoom1;
+        mpInst.outputState[IDX_FMC1] = mpInst.pirToggleLoadsOnRoom1;
     }
     else
     {
@@ -609,8 +670,8 @@ static VOID applyControlPolicy(VOID)
 
     if (mpInst.isAutoModeRoom2)
     {
-        mpInst.outputState[IDX_LMC2] = mpInst.pir[IDX_HD2];
-        mpInst.outputState[IDX_AC2] = mpInst.pir[IDX_HD2];
+        mpInst.outputState[IDX_LMC2] = mpInst.pirToggleLoadsOnRoom2;
+        mpInst.outputState[IDX_AC2] = mpInst.pirToggleLoadsOnRoom2;
     }
     else
     {
@@ -629,14 +690,24 @@ static VOID applyControlPolicy(VOID)
 static VOID applyUICommands(VOID)
 {
     UI_COMMANDS cmd;
+    BOOL wasAuto1;
+    BOOL wasAuto2;
 
     if (uiFetchCommands(&cmd) != RET_OK)
         return;
+
+    wasAuto1 = mpInst.isAutoModeRoom1 ? TRUE : FALSE;
+    wasAuto2 = mpInst.isAutoModeRoom2 ? TRUE : FALSE;
 
     if (cmd.hasRoom1Mode)
         mpInst.isAutoModeRoom1 = cmd.room1Auto ? TRUE : FALSE;
     if (cmd.hasRoom2Mode)
         mpInst.isAutoModeRoom2 = cmd.room2Auto ? TRUE : FALSE;
+
+    if (cmd.hasRoom1Mode && mpInst.isAutoModeRoom1 && !wasAuto1)
+        mpInst.pirPrevCoilRoom1 = mpInst.pir[IDX_HD1];
+    if (cmd.hasRoom2Mode && mpInst.isAutoModeRoom2 && !wasAuto2)
+        mpInst.pirPrevCoilRoom2 = mpInst.pir[IDX_HD2];
 
     if (cmd.hasRoom1Light)
         mpInst.manualState[IDX_LMC1] = cmd.room1Light ? 1U : 0U;
@@ -682,6 +753,8 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 	UINT16	idx = 0;
     time_t nowTs = 0;
     UINT64 nowMs = 0;
+
+    fprintf(stderr, "mainProc %s (%s)\n", APP_VERSION, __DATE__);
 
 	while((rc = getopt(argc, argv, "n:hdm")) != RET_FAILURE)
     {
@@ -734,6 +807,29 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
 					mpInst.state = STATE_ERROR;
 					break;
 				}
+
+                {
+                    UINT32 defTogMs = (UINT32)PIR_TOGGLE_DEBOUNCE_SEC_DEFAULT * 1000U;
+                    if (mpInst.args.pirVacancySecSetR1 != 0U)
+                        mpInst.pirToggleMinMsRoom1 = (UINT32)mpInst.args.pirVacancySecR1 * 1000U;
+                    else
+                        mpInst.pirToggleMinMsRoom1 = defTogMs;
+                    if (mpInst.args.pirVacancySecSetR2 != 0U)
+                        mpInst.pirToggleMinMsRoom2 = (UINT32)mpInst.args.pirVacancySecR2 * 1000U;
+                    else
+                        mpInst.pirToggleMinMsRoom2 = defTogMs;
+                    mpInst.pirPrevCoilRoom1 = 0U;
+                    mpInst.pirPrevCoilRoom2 = 0U;
+                    mpInst.pirToggleLoadsOnRoom1 = 0U;
+                    mpInst.pirToggleLoadsOnRoom2 = 0U;
+                    mpInst.pirLastToggleMsRoom1 = 0U;
+                    mpInst.pirLastToggleMsRoom2 = 0U;
+                }
+
+                mpInst.isAutoModeRoom1 = TRUE;
+                mpInst.isAutoModeRoom2 = TRUE;
+                mpInst.pirPrevCoilRoom1 = 0U;
+                mpInst.pirPrevCoilRoom2 = 0U;
 
                 if (uiInit(mpInst.args.uiFbdev, mpInst.args.uiTouchDev) != RET_OK)
                 {
@@ -864,7 +960,42 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                                 if(readModbusCoil(mpInst.ctx[idx], MODBUS_COIL_ADDR_READ, &mpInst.pir[idx]) != RET_OK)
                                     mpInst.mConnected[idx] = FALSE;
                                 else
+                                {
+                                    UINT8 cur = mpInst.pir[idx];
+
                                     mpInst.lastPirPollTs[idx] = nowMs;
+                                    /* Auto: each new detection (coil 0->1) alternates loads ON / OFF / ON / … */
+                                    if (idx == IDX_HD1 && mpInst.isAutoModeRoom1)
+                                    {
+                                        if (mpInst.pirPrevCoilRoom1 == 0U && cur != 0U)
+                                        {
+                                            if (mpInst.pirToggleMinMsRoom1 == 0U || mpInst.pirLastToggleMsRoom1 == 0U ||
+                                                (nowMs - mpInst.pirLastToggleMsRoom1) >= mpInst.pirToggleMinMsRoom1)
+                                            {
+                                                mpInst.pirToggleLoadsOnRoom1 ^= 1U;
+                                                mpInst.pirLastToggleMsRoom1 = nowMs;
+                                            }
+                                        }
+                                        mpInst.pirPrevCoilRoom1 = cur;
+                                    }
+                                    else if (idx == IDX_HD2 && mpInst.isAutoModeRoom2)
+                                    {
+                                        if (mpInst.pirPrevCoilRoom2 == 0U && cur != 0U)
+                                        {
+                                            if (mpInst.pirToggleMinMsRoom2 == 0U || mpInst.pirLastToggleMsRoom2 == 0U ||
+                                                (nowMs - mpInst.pirLastToggleMsRoom2) >= mpInst.pirToggleMinMsRoom2)
+                                            {
+                                                mpInst.pirToggleLoadsOnRoom2 ^= 1U;
+                                                mpInst.pirLastToggleMsRoom2 = nowMs;
+                                            }
+                                        }
+                                        mpInst.pirPrevCoilRoom2 = cur;
+                                    }
+                                    else if (idx == IDX_HD1)
+                                        mpInst.pirPrevCoilRoom1 = cur;
+                                    else if (idx == IDX_HD2)
+                                        mpInst.pirPrevCoilRoom2 = cur;
+                                }
                             }
                         }
                         else
@@ -895,6 +1026,14 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
                 uiState.modbusTotalDevices = CUR_SENS_SIMULATOR;
                 uiState.pirRoom1 = mpInst.pir[IDX_HD1];
                 uiState.pirRoom2 = mpInst.pir[IDX_HD2];
+                if (mpInst.isAutoModeRoom1)
+                    uiState.personOccupiedRoom1 = mpInst.pirToggleLoadsOnRoom1;
+                else
+                    uiState.personOccupiedRoom1 = mpInst.pir[IDX_HD1];
+                if (mpInst.isAutoModeRoom2)
+                    uiState.personOccupiedRoom2 = mpInst.pirToggleLoadsOnRoom2;
+                else
+                    uiState.personOccupiedRoom2 = mpInst.pir[IDX_HD2];
                 uiState.room1Light = mpInst.outputState[IDX_LMC1];
                 uiState.room1Fan = mpInst.outputState[IDX_FMC1];
                 uiState.room2Light = mpInst.outputState[IDX_LMC2];
@@ -977,6 +1116,11 @@ INT32 main(INT32 argc, CHAR **argv, CHAR **envp)
             default:
                 mpInst.state = STATE_ERROR;
             break;
+        }
+
+        if (mpInst.state != STATE_INIT)
+        {
+            uiProcess();
         }
     }
 

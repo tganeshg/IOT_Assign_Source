@@ -39,6 +39,7 @@ Each section **`[HD_1]` … `[RM_2]`** (subset allowed if `-n` &lt; 7) supports:
 | `sensorPort`   | Modbus TCP port |
 | `readInterval` | Used in DB / publish timing context |
 | `pirPollMs`    | **PIR only** (`HD_1`, `HD_2`): poll interval **100–5000** ms |
+| `pirVacancySec` | **PIR only** (`HD_1`, `HD_2`): in **Auto** mode, **minimum seconds between alternate ON/OFF toggles** (debounce between motion **edges**). The INI key name is historical; it does **not** mean “room vacant delay” anymore. Omit to use default **`PIR_TOGGLE_DEBOUNCE_SEC_DEFAULT`** (**2** s in `general.h`). If the key is **present**, **`0`** means no debounce (every new **0→1** coil transition may toggle). |
 
 ### UI section `[ui]`
 
@@ -69,17 +70,27 @@ Rough loop:
 5. **PUBLISH_MQTT** — Data and state topics when intervals elapse.
 6. Repeat from **CONNECT_MODBUS** unless **ERROR**.
 
-**LVGL** is driven via **`uiProcess()`** at the top of the loop and during Modbus / DB / MQTT work so touch stays responsive.
+**LVGL** is driven via **`uiProcess()`** often in the loop (after init, around Modbus/DB/MQTT, and at the end of each iteration) so timers and input stay responsive.
+
+**Auto mode + PIR:** loads follow an **alternate-detection** policy (not raw “PIR high = on”). On each **new motion detection**, the main process treats a **0→1** transition on the PIR read coil (after a throttled Modbus read) as one **toggle** step: **1st** detection → loads **ON**, **2nd** → **OFF**, **3rd** → ON, and so on. A **minimum time between toggles** is taken from **`pirVacancySec`** in the INI (seconds → ms); it suppresses false double-toggles from noisy retriggers while someone is still moving. **Manual** mode drives loads from the UI/MQTT only.
 
 ---
 
 ## 5) LVGL UI and touch
 
 - **Display**: Custom framebuffer flush in `lvgl_port_linux.c` (not `lv_linux_fbdev`), with a capped partial buffer for small-RAM targets.
+- **Rooms**: **Room 1** / **Room 2** tabs at the top; **Room 1** is the **default** visible panel on startup.
+- **Per-room card**:
+  - **Mode**: `lv_switch` for **Auto** / **Manual** (larger than stock dimensions + extended click area). A fixed-width **Auto/Manual** text label beside the switch avoids layout shift when the label text changes.
+  - **Motion**: **Yes/No** (raw PIR coil) and **Person In** / **Person Out** on the same row. In **Auto**, “Person” tracks **alternate** occupancy (`pirToggleLoadsOn`); in **Manual**, it follows raw PIR for that column.
+  - **Loads**: large ON/OFF bars for light/fan (room 1) or light/AC (room 2); room 2 mode row can show **Fridge** power when `RM_2` is present.
+- **Policy**: Both rooms start in **Auto** mode in firmware unless changed by UI/MQTT.
+- **`uiProcess()`** calls **`lv_timer_handler()`** multiple times per invocation so a busy Modbus/MQTT loop does not starve LVGL.
 - **Touch**:
   - If **`LV_USE_EVDEV`** is **1** in LVGL’s `lv_conf.h` (typical Yocto/SDK build), pointer input uses **`lv_evdev_create()`** on `touchDev`, same idea as the reference `lv_linux_init_input_pointer()` pattern.
-  - If **evdev is disabled**, the port falls back to a manual **`read()`** on the evdev node with calibration from `EVIOCGABS`.
-- Widget actions use **`lv_obj_add_event_cb`** (e.g. mode switches, room tabs, loads) — equivalent to registering callbacks on controls in sample apps, not a separate global “touch” callback.
+  - If **evdev is disabled**, the port uses a manual **`read()`** loop on the evdev node with **`EVIOCGABS`** calibration and recognizes **`BTN_TOUCH`**, **`ABS_MT_TRACKING_ID`**, pressure axes, and related keys where present (helps light taps).
+- Input tuning: **1 ms** indev timer, **scroll limit** / **long-press** set in `indev_apply_responsive_touch()`; the main **root** flex container is **not** scrollable so vertical drags are less likely to steal taps.
+- Widget actions use **`lv_obj_add_event_cb`** (mode switch, room tabs, loads).
 
 ---
 
@@ -99,8 +110,8 @@ Command (subscribe) and state (publish) topics include:
 | `smarthome/state/mode` | Aggregate: `AUTO`, `MANUAL`, or `MIXED` |
 | `smarthome/state/room1/mode` | Room 1 mode |
 | `smarthome/state/room2/mode` | Room 2 mode |
-| `smarthome/state/room1/pir` | `0` / `1` |
-| `smarthome/state/room2/pir` | `0` / `1` |
+| `smarthome/state/room1/pir` | `0` / `1` — **raw** PIR coil (same as **Motion** on the UI) |
+| `smarthome/state/room2/pir` | `0` / `1` — **raw** PIR coil |
 | `smarthome/state/room1/light` | `0` / `1` |
 | `smarthome/state/room1/fan` | `0` / `1` |
 | `smarthome/state/room2/light` | `0` / `1` |

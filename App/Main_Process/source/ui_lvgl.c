@@ -89,6 +89,8 @@ static lv_obj_t *gRoom2Panel;
 
 static lv_obj_t *gPir1ValueLabel;
 static lv_obj_t *gPir2ValueLabel;
+static lv_obj_t *gPir1PersonLbl;
+static lv_obj_t *gPir2PersonLbl;
 
 static lv_obj_t *gR1LightBtn;
 static lv_obj_t *gR1LightOnLbl;
@@ -258,6 +260,23 @@ static VOID onRoomSelectClick(lv_event_t *e)
 
 /* Left column width — keeps labels aligned and puts controls just after it (no huge center gap). */
 #define UI_ROW_LABEL_PCT 38
+/* Motion row: label | Yes/No (center) | Person In/Out */
+#define UI_PIR_COL_LABEL_PCT  28
+#define UI_PIR_COL_VALUE_PCT  32
+#define UI_PIR_COL_PERSON_PCT 40
+/* Light/Fan/AC ON/OFF bar height (embedded touch target). */
+#define UI_HOME_TOGGLE_BTN_H  58
+/* Pull Light/Fan (or Light/AC) block slightly toward Motion row */
+#define UI_GAP_PIR_TO_LOADS     (-8)
+#define UI_GAP_LIGHT_ROW_TOP    (-4)
+/* Mode switch: slightly larger than stock for easier touch (was 76x36 + ext 10). */
+#define UI_MODE_SWITCH_W        90
+#define UI_MODE_SWITCH_H        44
+#define UI_MODE_SWITCH_EXT_PAD  14
+/* Space between “Auto/Manual” text and the switch */
+#define UI_MODE_LABEL_PAD_AFTER   14
+/* Fixed slot width so “Auto” vs “Manual” does not shift the switch (fits longer word). */
+#define UI_MODE_LABEL_SLOT_W      118
 
 static VOID createRoomModeRow(lv_obj_t *parent, UI_CTRL_ID modeId, lv_obj_t **outSw, lv_obj_t **outLbl,
                                lv_obj_t **outFridgeLbl)
@@ -295,13 +314,19 @@ static VOID createRoomModeRow(lv_obj_t *parent, UI_CTRL_ID modeId, lv_obj_t **ou
         lv_obj_clear_flag(right, LV_OBJ_FLAG_SCROLLABLE);
 
         *outLbl = lv_label_create(right);
-        lv_label_set_text(*outLbl, "Manual");
+        lv_label_set_text(*outLbl, "Auto");
         lv_obj_add_style(*outLbl, &gStyleMuted, 0);
         lv_obj_set_style_pad_top(*outLbl, 0, 0);
         lv_obj_set_style_pad_bottom(*outLbl, 0, 0);
+        lv_obj_set_style_pad_right(*outLbl, UI_MODE_LABEL_PAD_AFTER, 0);
+        lv_obj_set_width(*outLbl, UI_MODE_LABEL_SLOT_W);
+        lv_obj_set_style_text_align(*outLbl, LV_TEXT_ALIGN_LEFT, 0);
+        lv_label_set_long_mode(*outLbl, LV_LABEL_LONG_MODE_CLIP);
 
         *outSw = lv_switch_create(right);
-        lv_obj_set_size(*outSw, 68, 32);
+        lv_obj_set_size(*outSw, UI_MODE_SWITCH_W, UI_MODE_SWITCH_H);
+        lv_obj_set_ext_click_area(*outSw, UI_MODE_SWITCH_EXT_PAD);
+        lv_obj_add_state(*outSw, LV_STATE_CHECKED);
         lv_obj_add_event_cb(*outSw, onSwitchEvent, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)modeId);
 
         if (outFridgeLbl != NULL)
@@ -321,7 +346,7 @@ static lv_obj_t *createHomeToggleRow(lv_obj_t *parent, const CHAR *name, UI_CTRL
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_set_width(row, lv_pct(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(row, 46, 0);
+    lv_obj_set_style_min_height(row, (lv_coord_t)(UI_HOME_TOGGLE_BTN_H + 12), 0);
     lv_obj_set_style_pad_all(row, 4, 0);
     lv_obj_set_style_pad_column(row, 6, 0);
     lv_obj_set_style_radius(row, 10, 0);
@@ -343,7 +368,8 @@ static lv_obj_t *createHomeToggleRow(lv_obj_t *parent, const CHAR *name, UI_CTRL
     lv_obj_remove_style_all(btn);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
     lv_obj_set_width(btn, lv_pct(26));
-    lv_obj_set_height(btn, 44);
+    lv_obj_set_height(btn, UI_HOME_TOGGLE_BTN_H);
+    lv_obj_set_ext_click_area(btn, 8);
     lv_obj_add_style(btn, &gStyleHomeBtnOff, 0);
     lv_obj_add_style(btn, &gStyleHomeBtnOn, LV_STATE_CHECKED);
     lv_obj_add_event_cb(btn, onSwitchEvent, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)id);
@@ -401,6 +427,25 @@ static VOID setStatusValue(lv_obj_t *label, BOOL isOk, const CHAR *okTxt, const 
     lv_obj_remove_style(label, &gStyleBad, 0);
     lv_obj_add_style(label, isOk ? &gStyleGood : &gStyleBad, 0);
     lv_label_set_text(label, isOk ? okTxt : badTxt);
+}
+
+static VOID setPersonInOutLabel(lv_obj_t *label, UINT8 motionOn)
+{
+    if (label == NULL)
+        return;
+
+    lv_obj_remove_style(label, &gStyleGood, 0);
+    lv_obj_remove_style(label, &gStyleMuted, 0);
+    if (motionOn != 0U)
+    {
+        lv_obj_add_style(label, &gStyleGood, 0);
+        lv_label_set_text(label, "Person In");
+    }
+    else
+    {
+        lv_obj_add_style(label, &gStyleMuted, 0);
+        lv_label_set_text(label, "Person Out");
+    }
 }
 
 static VOID setTogglePowerLabel(lv_obj_t *lbl, UINT8 isOn, UINT16 wattsW)
@@ -500,8 +545,8 @@ ERROR_CODE uiInit(const CHAR *fbdevPath, const CHAR *touchDevPath)
     lv_obj_set_flex_flow(root, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(root, 0, 0);
-    lv_obj_add_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
+    /* No root scroll: avoids vertical drags competing with buttons/switches on touch. */
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
     /* Header: title only (per-room Auto/Manual lives inside each room card). */
     lv_obj_t *header = lv_obj_create(root);
@@ -599,18 +644,26 @@ ERROR_CODE uiInit(const CHAR *fbdevPath, const CHAR *touchDevPath)
         lv_obj_set_layout(pirRow, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(pirRow, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(pirRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pirRow, 4, 0);
         lv_obj_clear_flag(pirRow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_margin_bottom(pirRow, UI_GAP_PIR_TO_LOADS, 0);
         lv_obj_t *pirK = lv_label_create(pirRow);
         lv_obj_add_style(pirK, &gStyleMuted, 0);
         lv_label_set_text(pirK, "Motion");
-        lv_obj_set_width(pirK, lv_pct(UI_ROW_LABEL_PCT));
+        lv_obj_set_width(pirK, lv_pct(UI_PIR_COL_LABEL_PCT));
         gPir1ValueLabel = lv_label_create(pirRow);
         lv_label_set_text(gPir1ValueLabel, "--");
-        lv_obj_set_flex_grow(gPir1ValueLabel, 1);
-        lv_obj_set_style_text_align(gPir1ValueLabel, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_width(gPir1ValueLabel, lv_pct(UI_PIR_COL_VALUE_PCT));
+        lv_obj_set_style_text_align(gPir1ValueLabel, LV_TEXT_ALIGN_CENTER, 0);
+        gPir1PersonLbl = lv_label_create(pirRow);
+        lv_obj_set_width(gPir1PersonLbl, lv_pct(UI_PIR_COL_PERSON_PCT));
+        lv_obj_set_style_text_align(gPir1PersonLbl, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(gPir1PersonLbl, "Person Out");
+        lv_obj_add_style(gPir1PersonLbl, &gStyleMuted, 0);
     }
 
     gR1LightBtn = createHomeToggleRow(gRoom1Panel, "Light", CTRL_R1_LIGHT, &gR1LightOnLbl, &gR1LightPowerLbl);
+    lv_obj_set_style_margin_top(lv_obj_get_parent(gR1LightBtn), UI_GAP_LIGHT_ROW_TOP, 0);
     gR1FanBtn = createHomeToggleRow(gRoom1Panel, "Fan", CTRL_R1_FAN, &gR1FanOnLbl, &gR1FanPowerLbl);
 
     gRoom2Panel = createCard(root, "Room 2", 0);
@@ -624,18 +677,26 @@ ERROR_CODE uiInit(const CHAR *fbdevPath, const CHAR *touchDevPath)
         lv_obj_set_layout(pirRow, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(pirRow, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(pirRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pirRow, 4, 0);
         lv_obj_clear_flag(pirRow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_margin_bottom(pirRow, UI_GAP_PIR_TO_LOADS, 0);
         lv_obj_t *pirK = lv_label_create(pirRow);
         lv_obj_add_style(pirK, &gStyleMuted, 0);
         lv_label_set_text(pirK, "Motion");
-        lv_obj_set_width(pirK, lv_pct(UI_ROW_LABEL_PCT));
+        lv_obj_set_width(pirK, lv_pct(UI_PIR_COL_LABEL_PCT));
         gPir2ValueLabel = lv_label_create(pirRow);
         lv_label_set_text(gPir2ValueLabel, "--");
-        lv_obj_set_flex_grow(gPir2ValueLabel, 1);
-        lv_obj_set_style_text_align(gPir2ValueLabel, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_width(gPir2ValueLabel, lv_pct(UI_PIR_COL_VALUE_PCT));
+        lv_obj_set_style_text_align(gPir2ValueLabel, LV_TEXT_ALIGN_CENTER, 0);
+        gPir2PersonLbl = lv_label_create(pirRow);
+        lv_obj_set_width(gPir2PersonLbl, lv_pct(UI_PIR_COL_PERSON_PCT));
+        lv_obj_set_style_text_align(gPir2PersonLbl, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(gPir2PersonLbl, "Person Out");
+        lv_obj_add_style(gPir2PersonLbl, &gStyleMuted, 0);
     }
 
     gR2LightBtn = createHomeToggleRow(gRoom2Panel, "Light", CTRL_R2_LIGHT, &gR2LightOnLbl, &gR2LightPowerLbl);
+    lv_obj_set_style_margin_top(lv_obj_get_parent(gR2LightBtn), UI_GAP_LIGHT_ROW_TOP, 0);
     gR2ACBtn = createHomeToggleRow(gRoom2Panel, "AC", CTRL_R2_AC, &gR2ACOnLbl, &gR2ACPowerLbl);
 
     lv_obj_add_flag(gRoom2Panel, LV_OBJ_FLAG_HIDDEN);
@@ -651,16 +712,11 @@ VOID uiProcess(VOID)
 {
 #ifdef ENABLE_LVGL
     uint32_t i;
-    uint32_t next;
 
     lv_port_linux_tick();
-    /* Drain due timers (incl. indev) when handler returns 0 = call again immediately. */
-    for (i = 0U; i < 16U; i++)
-    {
-        next = lv_timer_handler();
-        if (next != 0U)
-            break;
-    }
+    /* Extra timer passes keep indev + hit-testing ahead of a busy main loop. */
+    for (i = 0U; i < 20U; i++)
+        (void)lv_timer_handler();
 #endif
 }
 
@@ -672,12 +728,23 @@ VOID uiUpdateState(const UI_STATE *state)
     gUiState = *state;
 
 #ifdef ENABLE_LVGL
-    gUiSyncInProgress = TRUE;
-    setSwitchState(gR1ModeSwitch, gUiState.isAutoModeRoom1);
-    if (gR1ModeLabel)
+    /* Mode switches: only push LVGL when backend differs (avoids extra VALUE_CHANGED + long sync). */
+    if (gR1ModeSwitch != NULL && getSwitchState(gR1ModeSwitch) != gUiState.isAutoModeRoom1)
+    {
+        gUiSyncInProgress = TRUE;
+        setSwitchState(gR1ModeSwitch, gUiState.isAutoModeRoom1);
+        gUiSyncInProgress = FALSE;
+    }
+    if (gR1ModeLabel != NULL)
         lv_label_set_text(gR1ModeLabel, gUiState.isAutoModeRoom1 ? "Auto" : "Manual");
-    setSwitchState(gR2ModeSwitch, gUiState.isAutoModeRoom2);
-    if (gR2ModeLabel)
+
+    if (gR2ModeSwitch != NULL && getSwitchState(gR2ModeSwitch) != gUiState.isAutoModeRoom2)
+    {
+        gUiSyncInProgress = TRUE;
+        setSwitchState(gR2ModeSwitch, gUiState.isAutoModeRoom2);
+        gUiSyncInProgress = FALSE;
+    }
+    if (gR2ModeLabel != NULL)
         lv_label_set_text(gR2ModeLabel, gUiState.isAutoModeRoom2 ? "Auto" : "Manual");
 
     if (gStatusLineLabel)
@@ -694,11 +761,18 @@ VOID uiUpdateState(const UI_STATE *state)
         setStatusValue(gPir1ValueLabel, (gUiState.pirRoom1 != 0U), "Yes", "No");
     if (gPir2ValueLabel)
         setStatusValue(gPir2ValueLabel, (gUiState.pirRoom2 != 0U), "Yes", "No");
+    if (gPir1PersonLbl)
+        setPersonInOutLabel(gPir1PersonLbl, gUiState.personOccupiedRoom1);
+    if (gPir2PersonLbl)
+        setPersonInOutLabel(gPir2PersonLbl, gUiState.personOccupiedRoom2);
 
+    /* Home toggles: sync from Modbus/MQTT — block user callbacks only for this block. */
+    gUiSyncInProgress = TRUE;
     setHomeBtnVisual(gR1LightBtn, gR1LightOnLbl, gUiState.room1Light);
     setHomeBtnVisual(gR1FanBtn, gR1FanOnLbl, gUiState.room1Fan);
     setHomeBtnVisual(gR2LightBtn, gR2LightOnLbl, gUiState.room2Light);
     setHomeBtnVisual(gR2ACBtn, gR2ACOnLbl, gUiState.room2AC);
+    gUiSyncInProgress = FALSE;
 
     setTogglePowerLabel(gR1LightPowerLbl, gUiState.room1Light, gUiState.room1LightPowerW);
     setTogglePowerLabel(gR1FanPowerLbl, gUiState.room1Fan, gUiState.room1FanPowerW);
@@ -708,6 +782,7 @@ VOID uiUpdateState(const UI_STATE *state)
     if (gR2FridgePowerLbl)
         lv_label_set_text_fmt(gR2FridgePowerLbl, "Fridge %u W", (unsigned)gUiState.room2FridgePowerW);
 
+    gUiSyncInProgress = TRUE;
     if (gUiState.isAutoModeRoom1)
     {
         lv_obj_add_state(gR1LightBtn, LV_STATE_DISABLED);
