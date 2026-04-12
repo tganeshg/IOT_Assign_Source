@@ -1,0 +1,17 @@
+[MQTT]
+broker = 127.0.0.1
+port = 1883
+; username =
+; password =
+
+[DATABASE]
+; Local copy fed from topic sensor/data (same JSON as mainProc publishes)
+name = sensor_data_web.db
+
+[WEB]
+host = 0.0.0.0
+port = 5000
+
+[PERSON]
+; Seconds between alternate Person toggles in Auto (mirror mainProc pirVacancySec)
+debounce_sec = 2

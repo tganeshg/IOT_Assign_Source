@@ -1,3 +1,7 @@
 App/AppBin/*
 App/Main_Process/objects/*
 App/Sensor_Simulator/objects/*
+Web/*.db
+Web/.venv/
+Web/config.ini
+Web/__pycache__/

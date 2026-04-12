@@ -419,44 +419,43 @@ static ERROR_CODE insertDB(sqlite3 *db, UINT16 sensorID, UINT16 power)
 *************************************************************************/
 static ERROR_CODE publishMQTT(struct mosquitto *mosq, sqlite3 *db, UINT16 publishInterval)
 {
-    sqlite3_stmt *stmt=NULL;
-    CHAR temp[SIZE_256]={0};
-    INT32 rc=0;
+    CHAR temp[SIZE_256] = {0};
+    UINT16 idx;
+    INT32 rc = 0;
     size_t off = 0U;
     size_t cap = sizeof(mpInst.payload);
     int n;
+    int rowCount = 0;
 
     (void)mosq;
+    (void)db;
+    (void)publishInterval;
 
-    snprintf(temp, sizeof(temp),
-             "SELECT Device_ID, Power_Consumption, Timestamp FROM SensorData "
-             "WHERE Timestamp >= datetime('now', '-%d seconds') "
-             "ORDER BY Timestamp DESC LIMIT %d;",
-             publishInterval, MQTT_PUBLISH_JSON_MAX_ROWS);
-
-    rc = sqlite3_prepare_v2(db, temp, -1, &stmt, NULL);
-    if (rc != SQLITE_OK)
-    {
-        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
-        return RET_FAILURE;
-    }
+    /* Publish current Modbus power (same as LVGL / insertDB). The old SQL time-window
+     * could return no rows so nothing was sent to the broker even when simulators were live. */
+    generateTimestamp(mpInst.timestamp, sizeof(mpInst.timestamp));
 
     memset(mpInst.payload, 0, sizeof(mpInst.payload));
     n = snprintf(mpInst.payload, cap, "[");
     if (n < 0 || (size_t)n >= cap)
     {
-        sqlite3_finalize(stmt);
         return RET_FAILURE;
     }
     off = (size_t)n;
 
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+    for (idx = 0; idx < CUR_SENS_SIMULATOR; idx++)
     {
+        if (!mpInst.mConnected[idx] || isPIRIndex(idx))
+        {
+            continue;
+        }
+        if (rowCount >= MQTT_PUBLISH_JSON_MAX_ROWS)
+        {
+            break;
+        }
         memset(temp, 0, sizeof(temp));
-        n = snprintf(temp, sizeof(temp), "{\"sensorID\": %d, \"power\": %d, \"Timestamp\": \"%s\"},",
-                     sqlite3_column_int(stmt, 0),
-                     sqlite3_column_int(stmt, 1),
-                     sqlite3_column_text(stmt, 2));
+        n = snprintf(temp, sizeof(temp), "{\"sensorID\": %u, \"power\": %u, \"Timestamp\": \"%s\"},",
+                     (unsigned int)(idx + 1U), (unsigned int)mpInst.power[idx], mpInst.timestamp);
         if (n < 0 || (size_t)n >= sizeof(temp))
         {
             fprintf(stderr, "MQTT: single row JSON exceeds temp buffer\n");
@@ -465,13 +464,13 @@ static ERROR_CODE publishMQTT(struct mosquitto *mosq, sqlite3 *db, UINT16 publis
         if (off + (size_t)n + 1U > cap)
         {
             if (DEBUG_LOG)
-                fprintf(stderr, "MQTT: JSON aggregate capped at %zu bytes (unexpected)\n", cap);
+                fprintf(stderr, "MQTT: JSON aggregate capped at %zu bytes\n", cap);
             break;
         }
         memcpy(mpInst.payload + off, temp, (size_t)n + 1U);
         off += (size_t)n;
+        rowCount++;
     }
-    sqlite3_finalize(stmt);
 
     if (off > 1U && mpInst.payload[off - 1U] == ',')
     {
